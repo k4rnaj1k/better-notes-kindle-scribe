@@ -1,0 +1,111 @@
+name: Build BetterNotes
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      TARGET: kindlehf
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q \
+            build-essential autoconf automake bison flex gawk \
+            libtool libtool-bin libncurses-dev \
+            curl file git gperf help2man texinfo unzip wget \
+            libarchive-dev nettle-dev \
+            meson libgtk2.0-dev libxrandr-dev \
+            pkg-config python3
+
+      - name: Restore cached cross-compilation toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/x-tools
+          key: kindle-toolchain-${{ hashFiles('Dockerfile') }}
+          restore-keys: |
+            kindle-toolchain-
+
+      - name: Build koxtoolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive --depth=1 \
+            https://github.com/koreader/koxtoolchain.git /tmp/koxtoolchain
+          cd /tmp/koxtoolchain
+          chmod +x ./gen-tc.sh
+          ./gen-tc.sh $TARGET
+
+      - name: Build kindle-sdk
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive --depth=1 \
+            https://github.com/KindleModding/kindle-sdk.git /tmp/kindle-sdk
+          cd /tmp/kindle-sdk
+          export PATH="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/bin:$PATH"
+          chmod +x ./gen-sdk.sh
+          ./gen-sdk.sh $TARGET
+
+      - name: Copy XRandR headers into sysroot
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          SYSROOT="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/arm-${TARGET}-linux-gnueabihf/sysroot"
+          sudo mkdir -p "$SYSROOT/usr/include/X11/extensions"
+          sudo cp /usr/include/X11/extensions/Xrandr.h "$SYSROOT/usr/include/X11/extensions/"
+          sudo cp /usr/include/X11/extensions/randr.h  "$SYSROOT/usr/include/X11/extensions/"
+
+      - name: Restore cached tesseract/leptonica
+        id: cache-ocr
+        uses: actions/cache@v4
+        with:
+          path: ~/x-tools-extra
+          key: ocr-${{ hashFiles('deps/build-tesseract.sh') }}
+
+      - name: Build leptonica + tesseract for ${{ env.TARGET }}
+        if: steps.cache-ocr.outputs.cache-hit != 'true'
+        run: |
+          export PATH="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/bin:$PATH"
+          export SYSROOT="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/arm-${TARGET}-linux-gnueabihf/sysroot"
+          bash deps/build-tesseract.sh
+
+      - name: Set env
+        run: |
+          echo "MESON_CROSS=$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/meson-crosscompile.txt" >> $GITHUB_ENV
+          echo "$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/bin" >> $GITHUB_PATH
+          echo "PKG_CONFIG_PATH=$HOME/x-tools-extra/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Build betternotes
+        run: |
+          rm -rf builddir_kindle
+          meson setup --cross-file "$MESON_CROSS" builddir_kindle
+          meson compile -C builddir_kindle
+
+      - name: Stage KUAL extension
+        run: |
+          mkdir -p dist/extensions/betternotes/bin
+          cp builddir_kindle/betternotes dist/extensions/betternotes/bin/
+          cp kual/betternotes/config.xml kual/betternotes/menu.json \
+             dist/extensions/betternotes/
+          cp -r kual/betternotes/bin/* dist/extensions/betternotes/bin/ || true
+          # Bundle eng.traineddata when present (skipped on first scaffolded run)
+          if [ -f ~/x-tools-extra/share/tessdata/eng.traineddata ]; then
+            mkdir -p dist/extensions/betternotes/data
+            cp ~/x-tools-extra/share/tessdata/eng.traineddata \
+               dist/extensions/betternotes/data/
+          fi
+          tar -czf betternotes-${{ github.sha }}.tar.gz -C dist extensions
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: betternotes-${{ github.sha }}
+          path: betternotes-${{ github.sha }}.tar.gz
