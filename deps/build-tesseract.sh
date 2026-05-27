@@ -28,7 +28,7 @@ if [ ! -f "$PREFIX/lib/pkgconfig/lept.pc" ]; then
   pushd "leptonica-${LEPT_VER}"
     ./configure --host="$HOST" --prefix="$PREFIX" \
       --disable-programs --without-giflib --without-libwebp \
-      --without-libopenjpeg --without-libtiff
+      --without-libopenjpeg --without-libtiff --without-libjpeg
     make -j"$(nproc)"
     make install
   popd
