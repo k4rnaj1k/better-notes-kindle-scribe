@@ -29,7 +29,7 @@ jobs:
 
       - name: Restore cached cross-compilation toolchain
         id: cache-toolchain
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/x-tools
           key: kindle-toolchain-${{ hashFiles('Dockerfile') }}
@@ -63,9 +63,16 @@ jobs:
           sudo cp /usr/include/X11/extensions/Xrandr.h "$SYSROOT/usr/include/X11/extensions/"
           sudo cp /usr/include/X11/extensions/randr.h  "$SYSROOT/usr/include/X11/extensions/"
 
+      - name: Save toolchain cache
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/x-tools
+          key: kindle-toolchain-${{ hashFiles('Dockerfile') }}
+
       - name: Restore cached tesseract/leptonica
         id: cache-ocr
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/x-tools-extra
           key: ocr-${{ hashFiles('deps/build-tesseract.sh') }}
@@ -76,6 +83,13 @@ jobs:
           export PATH="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/bin:$PATH"
           export SYSROOT="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/arm-${TARGET}-linux-gnueabihf/sysroot"
           bash deps/build-tesseract.sh
+
+      - name: Save tesseract/leptonica cache
+        if: steps.cache-ocr.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/x-tools-extra
+          key: ocr-${{ hashFiles('deps/build-tesseract.sh') }}
 
       - name: Set env
         run: |
