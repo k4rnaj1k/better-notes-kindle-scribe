@@ -42,7 +42,9 @@ void cb_destroy(GtkWidget *, gpointer) { gtk_main_quit(); }
 
 gboolean cb_process_now(gpointer self) {
     static_cast<App *>(self)->process_async_events();
-    return G_SOURCE_REMOVE;  // one-shot; the pen thread schedules new ones
+    // G_SOURCE_REMOVE / G_SOURCE_CONTINUE landed in GLib 2.32; the Kindle
+    // sysroot is older, so use the literal it expands to (FALSE = remove).
+    return FALSE;
 }
 
 } // namespace
