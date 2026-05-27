@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
@@ -61,6 +62,10 @@ void probe_calibration(int fd, PenCalibration &cal) {
     if (ioctl(fd, EVIOCGABS(ABS_PRESSURE), &ai) == 0) {
         cal.max_pressure = ai.maximum ? ai.maximum : 4095;
     }
+    // Env-var overrides for on-device tuning.
+    if (const char *v = std::getenv("BN_PEN_SWAP_XY"))  cal.swap_xy  = (v[0] == '1');
+    if (const char *v = std::getenv("BN_PEN_INVERT_X")) cal.invert_x = (v[0] == '1');
+    if (const char *v = std::getenv("BN_PEN_INVERT_Y")) cal.invert_y = (v[0] == '1');
 }
 
 } // namespace
@@ -93,9 +98,10 @@ void PenReader::run() {
         return;
     }
     probe_calibration(fd, cal_);
-    log_info("pen: opened %s (x %d..%d y %d..%d p<=%d)",
+    log_info("pen: opened %s (x %d..%d y %d..%d p<=%d swap=%d ix=%d iy=%d)",
              dev, cal_.min_x, cal_.max_x, cal_.min_y, cal_.max_y,
-             cal_.max_pressure);
+             cal_.max_pressure, (int)cal_.swap_xy,
+             (int)cal_.invert_x, (int)cal_.invert_y);
 
     PenSample cur{};
     bool dirty = false;

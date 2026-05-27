@@ -20,6 +20,13 @@ echo "active" > "$MARKER"
 lipc-set-prop com.lab126.pillow disableEnablePillow disable 2>/dev/null
 lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
 
+# Lock the framebuffer to portrait ("U" = upright). Without this the
+# Scribe framework can leave the screen in landscape, which makes the
+# UI appear rotated 90 deg and breaks the pen swap_xy calibration.
+lipc-set-prop com.lab126.winmgr orientationLock U 2>/dev/null
+# Force the eink driver upright too, in case winmgr doesn't reach it.
+eips -o U 2>/dev/null || eips -u -o 0 2>/dev/null
+
 "$EXT_DIR/bin/betternotes" \
     --notes-dir "$NOTES_DIR" \
     --tessdata "$EXT_DIR/data" &
@@ -35,4 +42,5 @@ rm -f "$MARKER"
 # Thaw framework
 lipc-set-prop com.lab126.pillow disableEnablePillow enable 2>/dev/null
 lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null
+lipc-set-prop com.lab126.winmgr orientationLock FREE 2>/dev/null
 lipc-send-event com.lab126.hal.usbError cycled 2>/dev/null

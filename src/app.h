@@ -58,6 +58,7 @@ private:
     void map_pen_to_page(const PenSample &s, double &px, double &py);
 
     void redraw();
+    void redraw_rect(double x, double y, double w, double h);
 
     // --- state ---
     GtkWidget    *window_  = nullptr;
@@ -95,7 +96,6 @@ private:
     std::string   notes_dir_     = "/mnt/us/documents/betternotes";
     std::string   tessdata_dir_;
     std::string   status_;
-    guint         idle_source_   = 0;
 };
 
 } // namespace bn

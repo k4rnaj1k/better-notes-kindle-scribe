@@ -40,9 +40,9 @@ gboolean cb_motion(GtkWidget *, GdkEventMotion *e, gpointer self) {
 }
 void cb_destroy(GtkWidget *, gpointer) { gtk_main_quit(); }
 
-gboolean cb_idle(gpointer self) {
+gboolean cb_process_now(gpointer self) {
     static_cast<App *>(self)->process_async_events();
-    return TRUE;  // keep firing
+    return G_SOURCE_REMOVE;  // one-shot; the pen thread schedules new ones
 }
 
 } // namespace
@@ -56,6 +56,20 @@ App::App() = default;
 
 void App::redraw() {
     if (canvas_) gtk_widget_queue_draw(canvas_);
+}
+
+void App::redraw_rect(double x, double y, double w, double h) {
+    if (!canvas_) return;
+    // Inflate slightly so antialiased edges aren't clipped.
+    const int pad = 2;
+    int ix = (int)std::floor(x) - pad;
+    int iy = (int)std::floor(y) - pad;
+    int iw = (int)std::ceil(w) + 2 * pad;
+    int ih = (int)std::ceil(h) + 2 * pad;
+    if (ix < 0) { iw += ix; ix = 0; }
+    if (iy < 0) { ih += iy; iy = 0; }
+    if (iw <= 0 || ih <= 0) return;
+    gtk_widget_queue_draw_area(canvas_, ix, iy, iw, ih);
 }
 
 int App::run(int argc, char *argv[]) {
@@ -109,8 +123,9 @@ int App::run(int argc, char *argv[]) {
         }
     });
 
-    idle_source_ = g_timeout_add(16, cb_idle, this);
-
+    // Was a 16 ms polling timer. The pen thread now wakes the main loop
+    // directly via g_idle_add when a sample arrives, removing up to ~16 ms
+    // of input latency per stroke point.
     enter_browser();
     gtk_main();
 
@@ -123,8 +138,19 @@ int App::run(int argc, char *argv[]) {
 }
 
 void App::on_pen_sample(const PenSample &s) {
-    std::lock_guard<std::mutex> g(q_mu_);
-    pen_queue_.push(s);
+    bool was_empty;
+    {
+        std::lock_guard<std::mutex> g(q_mu_);
+        was_empty = pen_queue_.empty();
+        pen_queue_.push(s);
+    }
+    // Wake the GTK main loop immediately. g_idle_add is thread-safe in
+    // GLib >= 2.32 (the Kindle ships much newer). Only schedule once per
+    // batch — the main-thread handler drains everything in one pass, so
+    // re-scheduling for every queued sample just churns the event loop.
+    if (was_empty) {
+        g_idle_add_full(G_PRIORITY_HIGH_IDLE, cb_process_now, this, nullptr);
+    }
 }
 
 void App::process_async_events() {
@@ -162,8 +188,23 @@ void App::process_async_events() {
                 p.pressure = (float)s.pressure /
                     (float)std::max(1, pen_.calibration().max_pressure);
                 p.t_ms = s.t_ms;
+                // Bbox of the new segment (previous endpoint → new point),
+                // expanded by the stroke width so antialiased edges stay
+                // inside the dirty rect.
+                if (live_stroke_.pts.empty()) {
+                    redraw_rect(p.x - live_stroke_.width,
+                                p.y - live_stroke_.width,
+                                live_stroke_.width * 2,
+                                live_stroke_.width * 2);
+                } else {
+                    const Point &prev = live_stroke_.pts.back();
+                    double minx = std::min(prev.x, p.x) - live_stroke_.width;
+                    double miny = std::min(prev.y, p.y) - live_stroke_.width;
+                    double maxx = std::max(prev.x, p.x) + live_stroke_.width;
+                    double maxy = std::max(prev.y, p.y) + live_stroke_.width;
+                    redraw_rect(minx, miny, maxx - minx, maxy - miny);
+                }
                 live_stroke_.pts.push_back(p);
-                redraw();
             }
             if (!s.down && pen_down_) {
                 pen_down_ = false;

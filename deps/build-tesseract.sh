@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Build leptonica + tesseract for the Kindle (arm-kindlehf) cross sysroot.
-# Installs into $HOME/x-tools-extra (mirrors the layout of x-tools).
+#
+# Installs directly into the cross sysroot ($SYSROOT/usr). The cross
+# pkg-config wrapper sets PKG_CONFIG_SYSROOT_DIR, which prepends $SYSROOT
+# to every -I/-L from .pc files. Installing inside the sysroot makes
+# those rewrites resolve correctly. Traineddata still lives in
+# $HOME/x-tools-extra so the workflow can stage it without dipping back
+# into the sysroot.
 #
 # Required env (set by CI before invoking this script):
 #   TARGET    e.g. kindlehf
@@ -14,11 +20,12 @@ LEPT_VER=1.84.1
 TESS_VER=5.3.4
 TESSDATA_VER=4.1.0
 
-PREFIX="$HOME/x-tools-extra"
+PREFIX="$SYSROOT/usr"
+DATA_PREFIX="$HOME/x-tools-extra"
 BUILD="$HOME/x-tools-build"
 HOST="arm-${TARGET}-linux-gnueabihf"
 
-mkdir -p "$PREFIX" "$BUILD"
+mkdir -p "$PREFIX" "$DATA_PREFIX" "$BUILD"
 cd "$BUILD"
 
 # ---- leptonica ------------------------------------------------------------
@@ -27,10 +34,11 @@ if [ ! -f "$PREFIX/lib/pkgconfig/lept.pc" ]; then
     | tar xz
   pushd "leptonica-${LEPT_VER}"
     ./configure --host="$HOST" --prefix="$PREFIX" \
-      --disable-programs --without-giflib --without-libwebp \
+      --disable-programs --disable-shared --enable-static \
+      --without-giflib --without-libwebp \
       --without-libopenjpeg --without-libtiff --without-jpeg
     make -j"$(nproc)"
-    make install
+    sudo env PATH="$PATH" make install
   popd
 fi
 
@@ -41,18 +49,32 @@ if [ ! -f "$PREFIX/lib/pkgconfig/tesseract.pc" ]; then
   pushd "tesseract-${TESS_VER}"
     ./autogen.sh
     PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
-    LEPTONICA_CFLAGS="-I$PREFIX/include/leptonica" \
-    LEPTONICA_LIBS="-L$PREFIX/lib -llept" \
+    PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+    LDFLAGS="-static-libstdc++ -static-libgcc" \
+    ac_cv_header_archive_h=no \
+    ac_cv_header_curl_curl_h=no \
       ./configure --host="$HOST" --prefix="$PREFIX" \
-        --disable-graphics --disable-openmp --disable-shared --enable-static
+        --disable-graphics --disable-openmp --disable-shared --enable-static \
+        --disable-doc
     make -j"$(nproc)" training-deps=no
-    make install
+    sudo env PATH="$PATH" make install
   popd
 fi
 
+# Hand the freshly installed OCR files back to the runner so the cache
+# save/restore round-trip doesn't need sudo.
+sudo chown -R "$(id -u):$(id -g)" \
+  "$PREFIX/include/leptonica" \
+  "$PREFIX/include/tesseract" \
+  "$PREFIX/lib/pkgconfig/lept.pc" \
+  "$PREFIX/lib/pkgconfig/tesseract.pc" 2>/dev/null || true
+sudo find "$PREFIX/lib" -maxdepth 1 \
+  \( -name 'libleptonica.*' -o -name 'libtesseract.*' \) \
+  -exec chown "$(id -u):$(id -g)" {} +
+
 # ---- english traineddata --------------------------------------------------
-mkdir -p "$PREFIX/share/tessdata"
-if [ ! -f "$PREFIX/share/tessdata/eng.traineddata" ]; then
-  curl -fsSL -o "$PREFIX/share/tessdata/eng.traineddata" \
+mkdir -p "$DATA_PREFIX/share/tessdata"
+if [ ! -f "$DATA_PREFIX/share/tessdata/eng.traineddata" ]; then
+  curl -fsSL -o "$DATA_PREFIX/share/tessdata/eng.traineddata" \
     "https://github.com/tesseract-ocr/tessdata_fast/raw/${TESSDATA_VER}/eng.traineddata"
 fi

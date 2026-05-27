@@ -63,6 +63,15 @@ jobs:
           sudo cp /usr/include/X11/extensions/Xrandr.h "$SYSROOT/usr/include/X11/extensions/"
           sudo cp /usr/include/X11/extensions/randr.h  "$SYSROOT/usr/include/X11/extensions/"
 
+      - name: Make toolchain writable by runner user
+        run: |
+          # The sysroot (and parts of the toolchain) end up root-owned after
+          # gen-tc.sh / gen-sdk.sh, and that ownership is preserved by the
+          # toolchain cache. Hand ownership back to the runner unconditionally
+          # so the OCR install step and OCR cache restore can write into it
+          # without sudo.
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/x-tools"
+
       - name: Save toolchain cache
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -74,7 +83,14 @@ jobs:
         id: cache-ocr
         uses: actions/cache/restore@v4
         with:
-          path: ~/x-tools-extra
+          path: |
+            ~/x-tools-extra
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/include/leptonica
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/include/tesseract
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/libleptonica.*
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/libtesseract.*
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/pkgconfig/lept.pc
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/pkgconfig/tesseract.pc
           key: ocr-${{ hashFiles('deps/build-tesseract.sh') }}
 
       - name: Build leptonica + tesseract for ${{ env.TARGET }}
@@ -88,14 +104,20 @@ jobs:
         if: steps.cache-ocr.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ~/x-tools-extra
+          path: |
+            ~/x-tools-extra
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/include/leptonica
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/include/tesseract
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/libleptonica.*
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/libtesseract.*
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/pkgconfig/lept.pc
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/pkgconfig/tesseract.pc
           key: ocr-${{ hashFiles('deps/build-tesseract.sh') }}
 
       - name: Set env
         run: |
           echo "MESON_CROSS=$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/meson-crosscompile.txt" >> $GITHUB_ENV
           echo "$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/bin" >> $GITHUB_PATH
-          echo "PKG_CONFIG_PATH=$HOME/x-tools-extra/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Build betternotes
         run: |
