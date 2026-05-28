@@ -65,12 +65,15 @@ jobs:
 
       - name: Make toolchain writable by runner user
         run: |
-          # The sysroot (and parts of the toolchain) end up root-owned after
-          # gen-tc.sh / gen-sdk.sh, and that ownership is preserved by the
-          # toolchain cache. Hand ownership back to the runner unconditionally
-          # so the OCR install step and OCR cache restore can write into it
-          # without sudo.
+          # The sysroot (and parts of the toolchain) end up root-owned AND
+          # with read-only dir perms (mode 555) after gen-tc.sh / gen-sdk.sh,
+          # and that's preserved by the toolchain cache. Hand ownership back
+          # to the runner AND add the write bit, otherwise the OCR/FBInk cache
+          # restores can't mkdir inside sysroot/usr/include (the "Cannot
+          # mkdir: Permission denied" tar failure) and `make install` can't
+          # write there either.
           sudo chown -R "$(id -u):$(id -g)" "$HOME/x-tools"
+          sudo chmod -R u+rwX "$HOME/x-tools"
 
       - name: Save toolchain cache
         if: steps.cache-toolchain.outputs.cache-hit != 'true'

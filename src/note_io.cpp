@@ -34,8 +34,9 @@ Rect rect_from_json(const json::Value &v) {
 
 json::Value stroke_to_json(const Stroke &s) {
     json::Value o = json::Value::make_obj();
-    o.obj.emplace("tool",  json::Value::make_str(s.tool == Tool::Eraser ? "eraser" : "pen"));
-    o.obj.emplace("width", json::Value::make_num(s.width));
+    o.obj.emplace("tool",     json::Value::make_str(s.tool == Tool::Eraser ? "eraser" : "pen"));
+    o.obj.emplace("pen_type", json::Value::make_str(s.pen_type == PenType::Pen ? "pen" : "pencil"));
+    o.obj.emplace("width",    json::Value::make_num(s.width));
     json::Value pts = json::Value::make_arr();
     pts.arr.reserve(s.pts.size());
     for (auto &p : s.pts) {
@@ -52,8 +53,9 @@ json::Value stroke_to_json(const Stroke &s) {
 
 Stroke stroke_from_json(const json::Value &v) {
     Stroke s;
-    s.tool  = v.str("tool") == "eraser" ? Tool::Eraser : Tool::Pen;
-    s.width = v.num("width", 1.4);
+    s.tool     = v.str("tool") == "eraser" ? Tool::Eraser : Tool::Pen;
+    s.pen_type = v.str("pen_type") == "pen" ? PenType::Pen : PenType::Pencil;
+    s.width    = v.num("width", 1.4);
     auto *pts = v.get("pts");
     if (pts && pts->type == json::Type::Array) {
         s.pts.reserve(pts->arr.size());

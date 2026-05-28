@@ -7,11 +7,13 @@
 
 namespace bn {
 
-enum class Tool { Pen, Eraser, Lasso, Hand };
+enum class Tool    { Pen, Eraser, Lasso, Hand };
+enum class PenType { Pencil, Pen };
 
 struct Stroke {
-    Tool        tool = Tool::Pen;
-    double      width = 1.4;
+    Tool        tool     = Tool::Pen;
+    PenType     pen_type = PenType::Pencil;
+    double      width    = 1.4;
     std::vector<Point> pts;
 
     Rect bbox() const;

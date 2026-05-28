@@ -33,15 +33,14 @@ struct PenCalibration {
     int min_x = 0, max_x = 20967;   // Scribe Wacom defaults; auto-overridden
     int min_y = 0, max_y = 15725;
     int max_pressure = 4095;
-    // Maps the Scribe's landscape-native digitizer onto our 90°-rotated
-    // (portrait) drawing surface. After swap_xy, the horizontal screen axis
-    // (px) is driven by the device Y channel and the vertical axis (py) by
-    // the device X channel — so invert_y mirrors horizontally and invert_x
-    // mirrors vertically. Override per-axis at runtime with env vars
-    // BN_PEN_SWAP_XY / BN_PEN_INVERT_X / BN_PEN_INVERT_Y (each 0 or 1).
-    bool swap_xy  = true;
+    // Calibrated for the Scribe in portrait (rotation=0) from on-device
+    // corner samples: device X maps to screen X and device Y to screen Y
+    // (no swap), but both axes run opposite to the screen, so invert both.
+    // Override per-axis with BN_PEN_SWAP_XY / BN_PEN_INVERT_X /
+    // BN_PEN_INVERT_Y (each 0 or 1) if your unit differs.
+    bool swap_xy  = false;
     bool invert_x = true;
-    bool invert_y = false;
+    bool invert_y = true;
 };
 
 // Starts the background pen reader thread. cb is invoked on the reader

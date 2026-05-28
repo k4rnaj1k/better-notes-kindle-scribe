@@ -49,6 +49,9 @@ public:
     bool on_motion(double x, double y);
 
     void draw_link_picker(cairo_t *cr, int win_w, int win_h);
+    void draw_export_overlay(cairo_t *cr, int win_w, int win_h);  // PDF progress
+    void draw_show_tab(cairo_t *cr, int win_w);   // "show toolbar" tab when hidden
+    Rect show_tab_rect() const;                    // hit region for that tab
 
     // X11 window coords → drawing-space coords (inverse of the cairo
     // rotation applied in on_draw). Public: called by the GTK trampolines.
@@ -81,12 +84,14 @@ private:
     // --- note ops ---
     void save_current();
     void export_current_pdf();
+    Rect export_overlay_rect() const;   // centred progress card
 
     // --- pen sample → page coordinates ---
     void map_pen_to_page(const PenSample &s, double &px, double &py);
 
     void redraw();
     void redraw_rect(double x, double y, double w, double h);
+    void redraw_toolbar();   // fast partial repaint of the toolbar strip
 
     // Software rotation. The Kindle's X server doesn't support XRandR, so
     // we pre-rotate the cairo context and inverse-rotate input events.
@@ -106,7 +111,9 @@ private:
     int           xh_      = 0;
     int           win_w_   = 0;     // post-rotation drawing-space size (portrait)
     int           win_h_   = 0;
-    int           rotation_ = 90;   // degrees CW for portrait on Scribe
+    // The Scribe's X server is portrait-native, so 0 keeps the UI portrait.
+    // (rotation=90 rotated it INTO landscape.) Override with BN_ROTATION.
+    int           rotation_ = 0;
 
     Screen        screen_  = Screen::Browser;
     ToolState     tool_;
@@ -133,7 +140,19 @@ private:
     PenButton     active_button_  = PenButton::None;
     InkRect       live_ink_bbox_  = {0, 0, 0, 0};   // union of A2 updates for current stroke
 
+    // Eraser drag state: erase along the segment between consecutive samples
+    // so a fast sweep doesn't leave gaps.
+    bool          erase_active_   = false;
+    double        erase_px_       = 0;
+    double        erase_py_       = 0;
+
     LinkPicker    picker_;
+
+    // PDF export progress (drawn as a modal bar; export runs on the main
+    // thread and pumps the UI between pages).
+    bool          exporting_pdf_  = false;
+    int           export_done_    = 0;
+    int           export_total_   = 0;
 
     // Thread plumbing
     PenReader     pen_;

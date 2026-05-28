@@ -44,8 +44,12 @@ cd FBInk
 # quirks table (incl. the Scribe / MTK refresh path).
 export CROSS_TC="$HOST"
 
+# `staticlib` builds ONLY libfbink.a. The `static` target additionally
+# links the CLI tool (fbink_cmd.c), which requires fixed-cell font support
+# that MINIMAL=1 disables — that's the "Cannot build this tool without
+# fixed-cell font rendering support" error. We only need the library.
 make clean || true
-make CROSS_TC="$HOST" KINDLE=1 MINIMAL=1 DEBUG=0 static -j"$(nproc)"
+make CROSS_TC="$HOST" KINDLE=1 MINIMAL=1 DEBUG=0 staticlib -j"$(nproc)"
 
 # The static target produces Release/libfbink.a (+ the public header at root).
 install -d "$PREFIX/lib" "$PREFIX/include"

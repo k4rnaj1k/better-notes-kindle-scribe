@@ -38,9 +38,26 @@ echo "active" > "$MARKER"
 lipc-set-prop com.lab126.pillow disableEnablePillow disable 2>/dev/null
 lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
 
+# Low-latency direct-framebuffer ink via FBInk. Comment this out to fall
+# back to the slower (but always-correct) GTK redraw path. Look for an
+# "inkfb: ok ..." line in the log to confirm it initialised.
+export BN_ENABLE_INKFB=1
+
+# UI orientation. Default 0 = portrait (the Scribe X server is portrait-
+# native). If the UI/writing comes out landscape, try 90/180/270.
+# export BN_ROTATION=0
+
+# Pen orientation overrides. Defaults: swap=0 ix=0 iy=0. Calibrate by drawing
+# a dot in each corner and reading the "pen-down raw=... -> page=..." lines in
+# /tmp/betternotes.log, then set these so the corners map correctly. Each 0/1.
+# export BN_PEN_SWAP_XY=0
+# export BN_PEN_INVERT_X=0
+# export BN_PEN_INVERT_Y=0
+
 "$EXT_DIR/bin/betternotes" \
     --notes-dir "$NOTES_DIR" \
-    --tessdata "$EXT_DIR/data" &
+    --tessdata "$EXT_DIR/data" \
+    >/tmp/betternotes.log 2>&1 &
 APP_PID=$!
 
 while [ -f "$MARKER" ] && kill -0 "$APP_PID" 2>/dev/null; do

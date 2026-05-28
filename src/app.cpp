@@ -68,6 +68,40 @@ void App::redraw() {
     if (canvas_) gtk_widget_queue_draw(canvas_);
 }
 
+Rect App::show_tab_rect() const {
+    // Small tab at the top-right corner, shown when the toolbar is hidden.
+    double w = 84.0, h = 52.0;
+    return Rect{(double)win_w_ - w - 8.0, 0.0, w, h};
+}
+
+void App::draw_show_tab(cairo_t *cr, int win_w) {
+    (void)win_w;
+    Rect r = show_tab_rect();
+    cairo_set_source_rgb(cr, 0.92, 0.92, 0.92);
+    cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_stroke(cr);
+    // Down chevron = "pull the toolbar back down".
+    double cx = r.x + r.w / 2.0, cy = r.y + r.h / 2.0, s = 14.0;
+    cairo_set_source_rgb(cr, 0.15, 0.15, 0.15);
+    cairo_set_line_width(cr, 3.0);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_move_to(cr, cx - s, cy - s * 0.4);
+    cairo_line_to(cr, cx, cy + s * 0.4);
+    cairo_line_to(cr, cx + s, cy - s * 0.4);
+    cairo_stroke(cr);
+}
+
+void App::redraw_toolbar() {
+    // Partial repaint of just the toolbar strip at the top. A full redraw()
+    // would trigger a slow full-screen e-ink refresh for every button tap
+    // (and for show/hide), which makes the UI feel sluggish. Always cover
+    // the full laid-out toolbar height so toggling visibility cleanly
+    // repaints the whole strip (toolbar ↔ revealed page content).
+    redraw_rect(0, 0, (double)win_w_, toolbar_.full_height());
+}
+
 void App::redraw_rect(double x, double y, double w, double h) {
     if (!canvas_) return;
     // Map drawing-space rect → window (X11) rect by applying the same
@@ -221,6 +255,11 @@ void App::on_pen_sample(const PenSample &s) {
 }
 
 void App::process_async_events() {
+    // While a PDF is being written we re-enter the GTK loop to animate the
+    // progress bar. Don't drain pen/OCR events here — both mutate note_, which
+    // export_pdf is reading. They stay queued and run once export finishes.
+    if (exporting_pdf_) return;
+
     std::queue<PenSample> pq;
     std::queue<OcrResult> oq;
     {
@@ -232,12 +271,19 @@ void App::process_async_events() {
     while (!pq.empty()) {
         const PenSample s = pq.front(); pq.pop();
         if (screen_ != Screen::NoteView) continue;
+        // The dropdown is opened by finger (GTK) taps; a stylus touch on the
+        // canvas dismisses it so drawing isn't blocked by a stale overlay.
+        if (s.down && toolbar_.pen_menu_open()) {
+            double extent = toolbar_.pen_menu_extent();
+            toolbar_.close_pen_menu();
+            redraw_rect(0, 0, (double)win_w_, extent);
+        }
         if (s.tool == PenButton::Rubber && tool_.current != Tool::Eraser) {
             tool_.current = Tool::Eraser;
-            redraw();
+            redraw_toolbar();   // only the active-tool indicator changes
         } else if (s.tool == PenButton::Pen && tool_.current == Tool::Eraser) {
             tool_.current = Tool::Pen;
-            redraw();
+            redraw_toolbar();
         }
 
         double px, py;
@@ -246,9 +292,21 @@ void App::process_async_events() {
         if (tool_.current == Tool::Pen) {
             if (s.down && !pen_down_) {
                 pen_down_ = true;
+                const PenPreset &pp = kPenPresets[tool_.pen_preset];
                 live_stroke_ = Stroke{};
-                live_stroke_.tool = Tool::Pen;
-                live_stroke_.width = tool_.pen_width;
+                live_stroke_.tool     = Tool::Pen;
+                live_stroke_.pen_type = pp.type;
+                live_stroke_.width    = pp.width;
+                // Calibration aid: dumps the raw device coords and where
+                // they mapped to. Draw a dot in each corner and read these
+                // off the log to derive the exact swap/invert combo.
+                const PenCalibration &c = pen_.calibration();
+                log_info("pen-down raw=(%d,%d) range x[%d..%d] y[%d..%d] "
+                         "-> page=(%.0f,%.0f) win=%dx%d "
+                         "swap=%d ix=%d iy=%d",
+                         s.x, s.y, c.min_x, c.max_x, c.min_y, c.max_y,
+                         px, py, win_w_, win_h_,
+                         (int)c.swap_xy, (int)c.invert_x, (int)c.invert_y);
             }
             if (pen_down_ && s.down) {
                 Point p; p.x = px; p.y = py;
@@ -256,26 +314,18 @@ void App::process_async_events() {
                     (float)std::max(1, pen_.calibration().max_pressure);
                 p.t_ms = s.t_ms;
 
-                // redraw_rect / inkfb want DRAWING-space coords (y=0 at
-                // the window top), but stroke points are page-local, so add
-                // the toolbar height back for the dirty-rect / fb segment.
-                double th = toolbar_.height();
-
-                // Always queue a GTK partial redraw of the new segment so
-                // the stroke is visible mid-draw (this is the reliable path
-                // under X). If inkfb is enabled, *also* push the segment to
-                // the framebuffer for instant A2 feedback on top.
+                // Page coords == screen coords now (overlay model), so no
+                // toolbar offset. When the fast framebuffer path is live,
+                // draw ONLY through it — the GTK partial redraw would fire a
+                // second, slower e-ink refresh over the same region and
+                // reintroduce lag. The clean cairo render happens once on
+                // pen-up. When inkfb is unavailable, fall back to the GTK
+                // partial redraw so the stroke is still visible mid-draw.
                 if (!live_stroke_.pts.empty()) {
                     const Point &prev = live_stroke_.pts.back();
-                    double minx = std::min(prev.x, p.x) - live_stroke_.width;
-                    double miny = std::min(prev.y, p.y) - live_stroke_.width;
-                    double maxx = std::max(prev.x, p.x) + live_stroke_.width;
-                    double maxy = std::max(prev.y, p.y) + live_stroke_.width;
-                    redraw_rect(minx, miny + th, maxx - minx, maxy - miny);
-
                     if (inkfb_available()) {
-                        InkRect r = inkfb_draw_segment(prev.x, prev.y + th,
-                                                       p.x, p.y + th,
+                        InkRect r = inkfb_draw_segment(prev.x, prev.y,
+                                                       p.x, p.y,
                                                        live_stroke_.width);
                         if (live_ink_bbox_.w == 0) {
                             live_ink_bbox_ = r;
@@ -288,10 +338,16 @@ void App::process_async_events() {
                                               r.y + r.h);
                             live_ink_bbox_ = {ax, ay, bx - ax, by - ay};
                         }
+                    } else {
+                        double minx = std::min(prev.x, p.x) - live_stroke_.width;
+                        double miny = std::min(prev.y, p.y) - live_stroke_.width;
+                        double maxx = std::max(prev.x, p.x) + live_stroke_.width;
+                        double maxy = std::max(prev.y, p.y) + live_stroke_.width;
+                        redraw_rect(minx, miny, maxx - minx, maxy - miny);
                     }
-                } else {
+                } else if (!inkfb_available()) {
                     redraw_rect(p.x - live_stroke_.width,
-                                p.y - live_stroke_.width + th,
+                                p.y - live_stroke_.width,
                                 live_stroke_.width * 2,
                                 live_stroke_.width * 2);
                 }
@@ -309,35 +365,59 @@ void App::process_async_events() {
                     live_stroke_ = Stroke{};
                     note_.mark_dirty();
                     if (tool_.ocr_enabled) {
-                        ocr_.notify(note_, current_page_, win_w_,
-                                    win_h_ - (int)toolbar_.height() - 36);
+                        ocr_.notify(note_, current_page_, win_w_, win_h_);
                     }
                     if (inkfb_available() && live_ink_bbox_.w > 0) {
-                        // Snap the A2 ghost into clean GC16 grey.
+                        // inkfb already painted this stroke into the
+                        // framebuffer; a GC16 settle just snaps the A2 ghost to
+                        // clean grey without altering the ink. Deliberately do
+                        // NOT re-render through cairo here — cairo draws a
+                        // subtly different (antialiased, pressure-tapered)
+                        // stroke, which made the ink visibly "snap"/sharpen the
+                        // instant the pen lifted. Leaving the as-drawn pixels
+                        // means nothing changes on pen-up, like the stock app.
                         inkfb_settle(live_ink_bbox_);
+                    } else {
+                        // No fast framebuffer path: the live preview was GTK
+                        // partial redraws, so paint the committed stroke once
+                        // through cairo. Page coords == screen coords, so a
+                        // partial repaint of the stroke bbox suffices (a full
+                        // redraw would fire a slow whole-screen e-ink refresh).
+                        redraw_rect(bb.x - sw, bb.y - sw,
+                                    bb.w + 2 * sw, bb.h + 2 * sw);
                     }
                     live_ink_bbox_ = {0, 0, 0, 0};
-                    // Repaint ONLY the stroke's region (page-local → drawing
-                    // space via + toolbar height). A full redraw() here would
-                    // trigger a slow full-screen e-ink refresh (~1 s); the
-                    // committed stroke occupies the same pixels the live
-                    // segments already drew, so a partial repaint suffices.
-                    redraw_rect(bb.x - sw, bb.y - sw + toolbar_.height(),
-                                bb.w + 2 * sw, bb.h + 2 * sw);
                 }
             }
         } else if (tool_.current == Tool::Eraser) {
             if (s.down && current_page_ < (int)note_.pages.size()) {
-                int n = canvas_erase_at(note_.pages[current_page_],
-                                        px, py, tool_.eraser_radius);
-                if (n > 0) { note_.mark_dirty(); redraw(); }
+                // Sweep from the previous sample to this one so a fast drag
+                // erases the whole path, not isolated dots.
+                double ex0 = erase_active_ ? erase_px_ : px;
+                double ey0 = erase_active_ ? erase_py_ : py;
+                erase_active_ = true;
+                erase_px_ = px; erase_py_ = py;
+                Rect d = canvas_erase_at(note_.pages[current_page_],
+                                         ex0, ey0, px, py, tool_.eraser_radius);
+                if (d.w > 0 || d.h > 0) {
+                    note_.mark_dirty();
+                    // Repaint ONLY the erased footprint — a full redraw() here
+                    // fired a slow whole-screen e-ink refresh on every sample
+                    // and dropped frames mid-drag.
+                    redraw_rect(d.x, d.y, d.w, d.h);
+                }
+            } else if (!s.down) {
+                erase_active_ = false;
             }
         } else if (tool_.current == Tool::Lasso) {
             if (s.down) {
                 if (!pen_down_) { pen_down_ = true; lasso_.clear(); }
                 Point p; p.x = px; p.y = py;
                 lasso_.pts.push_back(p);
-                redraw();
+                // Repaint only the lasso's growing bbox, not the whole screen,
+                // so dragging stays responsive instead of dropping frames.
+                Rect lb = lasso_.bbox();
+                redraw_rect(lb.x - 4, lb.y - 4, lb.w + 8, lb.h + 8);
             } else if (pen_down_) {
                 pen_down_ = false;
                 lasso_.closed = lasso_.pts.size() >= 3;
@@ -396,14 +476,12 @@ void App::map_pen_to_page(const PenSample &s, double &px, double &py) {
     if (c.invert_x) nx = 1.0 - nx;
     if (c.invert_y) ny = 1.0 - ny;
     if (c.swap_xy) std::swap(nx, ny);
-    // The pen's physical range spans the WHOLE screen, so map it to the
-    // full window height first, then subtract the toolbar height to land
-    // in page-local space (y=0 = top of page content, which on_draw
-    // re-translates down by the toolbar height). This makes the ink appear
-    // exactly under the pen instead of drifting downward. Touching the
-    // toolbar strip maps to negative py (above the page = not drawn).
+    // Overlay model: the page fills the whole screen and the toolbar is
+    // drawn on top of it, so page coords == screen coords. The pen's full
+    // physical range maps straight to the full window — ink lands exactly
+    // under the pen, and hiding/showing the toolbar never shifts strokes.
     px = nx * (double)win_w_;
-    py = ny * (double)win_h_ - toolbar_.height();
+    py = ny * (double)win_h_;
 }
 
 void App::enter_browser() {
@@ -518,11 +596,90 @@ void App::save_current() {
 void App::export_current_pdf() {
     if (note_.id.empty()) return;
     std::string out = notes_dir_ + "/" + note_.id + ".pdf";
-    // A4 in points: 595 x 842
-    if (export_pdf(out, note_, 595, 842))
-        status_ = "pdf → " + out;
-    else
-        status_ = "pdf failed";
+    // Strokes are stored in full-screen page-pixel space. Derive the PDF
+    // page size from that aspect ratio (uniform scale) so the export isn't
+    // squashed — a landscape note exports to a landscape page, a portrait
+    // note to a portrait page. Cap the long edge at the A4 long dimension.
+    double src_w = win_w_ > 0 ? (double)win_w_ : 1404.0;
+    double src_h = win_h_ > 0 ? (double)win_h_ : 1872.0;
+    const double A4_LONG = 842.0;   // pt
+    double scale = A4_LONG / std::max(src_w, src_h);
+    double page_w = src_w * scale;
+    double page_h = src_h * scale;
+
+    // Export runs synchronously on the main thread; drive a modal progress
+    // bar by repainting + pumping the GTK loop between pages. Input is gated
+    // off (see on_button_*/process_async_events) while exporting_pdf_ is set,
+    // so the re-entrant pump can't mutate the note mid-write.
+    exporting_pdf_ = true;
+    export_total_  = (int)std::max<size_t>(1, note_.pages.size());
+    export_done_   = 0;
+    status_        = "exporting pdf…";
+    redraw();   // lay down the dim backdrop + initial bar
+    while (gtk_events_pending()) gtk_main_iteration();
+
+    bool ok = export_pdf(out, note_, page_w, page_h, src_w, src_h,
+        [this](int done, int total) {
+            export_done_  = done;
+            export_total_ = std::max(1, total);
+            Rect c = export_overlay_rect();
+            redraw_rect(c.x, c.y, c.w, c.h);   // update just the card
+            while (gtk_events_pending()) gtk_main_iteration();
+        });
+
+    exporting_pdf_ = false;
+    status_ = ok ? ("pdf → " + out) : "pdf failed";
+    redraw();   // clear the overlay
+}
+
+Rect App::export_overlay_rect() const {
+    double cw = std::min(460.0, win_w_ * 0.8);
+    double ch = 150.0;
+    double cx = (win_w_ - cw) / 2.0;
+    double cy = (win_h_ - ch) / 2.0;
+    return Rect{cx, cy, cw, ch};
+}
+
+void App::draw_export_overlay(cairo_t *cr, int win_w, int win_h) {
+    // Dim the page behind the card.
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
+    cairo_rectangle(cr, 0, 0, win_w, win_h);
+    cairo_fill(cr);
+
+    Rect c = export_overlay_rect();
+    cairo_set_source_rgb(cr, 0.97, 0.97, 0.97);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_stroke(cr);
+
+    // Title.
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string("Sans 16");
+    pango_layout_set_font_description(layout, fd);
+    pango_font_description_free(fd);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Exporting PDF  %d/%d",
+                  std::min(export_done_, export_total_), export_total_);
+    pango_layout_set_text(layout, buf, -1);
+    cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
+    cairo_move_to(cr, c.x + 24, c.y + 26);
+    pango_cairo_show_layout(cr, layout);
+    g_object_unref(layout);
+
+    // Progress bar track + fill.
+    double bx = c.x + 24, bw = c.w - 48;
+    double by = c.y + c.h - 48, bh = 22;
+    double frac = export_total_ > 0
+        ? (double)export_done_ / (double)export_total_ : 0.0;
+    if (frac < 0) frac = 0; else if (frac > 1) frac = 1;
+    cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
+    cairo_rectangle(cr, bx, by, bw, bh); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.15, 0.15, 0.15);
+    cairo_rectangle(cr, bx, by, bw * frac, bh); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
+    cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, bx, by, bw, bh); cairo_stroke(cr);
 }
 
 void App::set_rotation(int deg) {
@@ -579,10 +736,9 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
 
     toolbar_.layout(win_w);
     if (screen_ == Screen::NoteView) {
-        cairo_save(cr);
-        cairo_translate(cr, 0, toolbar_.height());
+        // Full-screen page; the toolbar overlays the top when visible.
         double page_w = win_w;
-        double page_h = win_h - toolbar_.height() - 36.0;
+        double page_h = win_h;
         if (current_page_ < (int)note_.pages.size())
             canvas_render_page(cr, note_.pages[current_page_], page_w, page_h);
         if (pen_down_ && tool_.current == Tool::Pen)
@@ -609,7 +765,6 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
             cairo_set_line_width(cr, 1.0);
             cairo_stroke(cr);
         }
-        cairo_restore(cr);
     } else if (screen_ == Screen::Markdown) {
         // Splice a visible cursor marker into the buffer at cursor pos so
         // the user can see where typing will land. U+2502 BOX DRAWINGS
@@ -618,8 +773,8 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
         std::string with_cursor = markdown_buf_;
         size_t cur = std::min(markdown_cursor_, with_cursor.size());
         with_cursor.insert(cur, "\xe2\x94\x82");  // "│"
-        double y = render_markdown(cr, 24, toolbar_.height() + 12,
-                                   win_w - 48, with_cursor);
+        double top = toolbar_.height() + 12;
+        double y = render_markdown(cr, 24, top, win_w - 48, with_cursor);
         (void)y;
     }
 
@@ -628,12 +783,22 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
         keyboard_.draw(cr);
     }
 
+    // Floating "show toolbar" tab whenever the toolbar is hidden.
+    if (screen_ != Screen::Browser && !toolbar_.visible()) {
+        draw_show_tab(cr, win_w);
+    }
+
     toolbar_.draw(cr, tool_, status_, current_page_,
                   (int)std::max<size_t>(1, note_.pages.size()));
 
     // Link picker modal sits on top of everything else.
     if (picker_.open) {
         draw_link_picker(cr, win_w, win_h);
+    }
+
+    // PDF export progress sits above even the picker.
+    if (exporting_pdf_) {
+        draw_export_overlay(cr, win_w, win_h);
     }
 }
 
@@ -809,11 +974,18 @@ void App::draw_link_picker(cairo_t *cr, int win_w, int win_h) {
 }
 
 bool App::on_button_press(double x, double y) {
+    // PDF export is a blocking modal; ignore input until it finishes.
+    if (exporting_pdf_) return true;
+
     // Modal: link picker intercepts everything else.
     if (picker_.open) {
         handle_picker_press(x, y);
         return true;
     }
+
+    // Pen-preset dropdown swallows presses; the matching release selects a
+    // preset or dismisses the menu.
+    if (toolbar_.pen_menu_open()) return true;
 
     if (screen_ == Screen::Browser) {
         BrowserHit h = browser_.hit(x, y, index_.entries().size());
@@ -834,21 +1006,39 @@ bool App::on_button_press(double x, double y) {
         return true;
     }
 
+    // When the toolbar is hidden, consume a press on the "show" tab here;
+    // the actual show happens on release so the release doesn't land on a
+    // freshly-revealed toolbar button (which sits at the same top-right spot
+    // and would immediately hide it again).
+    if (screen_ != Screen::Browser && !toolbar_.visible()) {
+        if (show_tab_rect().contains(x, y)) {
+            return true;
+        }
+        // Taps elsewhere fall through to normal handling (link follow, etc.).
+    }
+
     if (y < toolbar_.height()) {
         toolbar_.press(x, y);
-        redraw();
+        // Repaint only the tapped button — a much smaller e-ink refresh than
+        // the whole strip, so press feedback feels immediate.
+        Rect br = toolbar_.button_rect_at(x, y);
+        if (br.w > 0) redraw_rect(br.x, br.y, br.w, br.h);
+        else          redraw_toolbar();
         return true;
     }
     if (keyboard_.visible() && y >= keyboard_.top_y()) {
         keyboard_.press(x, y);
-        redraw();
+        // Key-press feedback only repaints the on-screen keyboard, not the
+        // whole markdown body above it.
+        redraw_rect(0, keyboard_.top_y(),
+                    (double)win_w_, (double)win_h_ - keyboard_.top_y());
         return true;
     }
 
-    // Tap-to-follow inside a link rect (Pen tool, single tap). Link rects
-    // are page-local, so shift the tap into page space first.
+    // Tap-to-follow inside a link rect (Pen tool, single tap). Page coords
+    // == screen coords now, so the tap maps directly.
     if (screen_ == Screen::NoteView && tool_.current == Tool::Pen) {
-        const Link *l = link_at(note_, current_page_, x, y - toolbar_.height());
+        const Link *l = link_at(note_, current_page_, x, y);
         if (l) {
             // Resolve against the vault — handles bare names ("MyNote"),
             // sub-folder paths ("work/meeting"), .md vs note-dir, and
@@ -875,17 +1065,56 @@ bool App::on_button_press(double x, double y) {
 }
 
 bool App::on_button_release(double x, double y) {
+    if (exporting_pdf_) return true;
     if (screen_ == Screen::Browser) return true;
+
+    // Toolbar hidden: the only chrome is the show-tab. Reveal it here on
+    // release (the toolbar is still hidden at this point, so this release
+    // can't accidentally trigger a toolbar button).
+    if (!toolbar_.visible()) {
+        if (show_tab_rect().contains(x, y)) {
+            toolbar_.set_visible(true);
+            redraw_toolbar();   // only the top strip changes — fast refresh
+        }
+        return true;
+    }
+
+    // Pen-preset dropdown is modal-ish: a tap either picks a preset or
+    // dismisses it. Its items hang below the toolbar strip, so this must run
+    // before the y < height() gate.
+    if (toolbar_.pen_menu_open()) {
+        int preset = toolbar_.pen_menu_hit(x, y);
+        if (preset >= 0) {
+            tool_.current    = Tool::Pen;
+            tool_.pen_preset = preset;
+        }
+        double extent = toolbar_.pen_menu_extent();
+        toolbar_.close_pen_menu();
+        redraw_rect(0, 0, (double)win_w_, extent);   // clear just the band
+        return true;
+    }
+
     if (y < toolbar_.height()) {
         ToolbarAction a = toolbar_.hit(x, y);
         toolbar_.release_all();
+        // Most actions only change the toolbar/status; those get a fast
+        // partial refresh. Actions that change the page/screen content set
+        // full_redraw so the whole canvas repaints.
+        bool full_redraw = false;
         switch (a) {
-            case ToolbarAction::Pen:       tool_.current = Tool::Pen;    break;
+            case ToolbarAction::Pen:
+                tool_.current = Tool::Pen;
+                toolbar_.toggle_pen_menu();   // reveal/hide the preset dropdown
+                // Repaint just the toolbar strip + dropdown band — a full
+                // redraw fires a slow whole-screen e-ink refresh.
+                redraw_rect(0, 0, (double)win_w_, toolbar_.pen_menu_extent());
+                return true;
             case ToolbarAction::Eraser:    tool_.current = Tool::Eraser; break;
             case ToolbarAction::Lasso:     tool_.current = Tool::Lasso;  break;
             case ToolbarAction::Keyboard:
                 tool_.keyboard_visible = !tool_.keyboard_visible;
                 keyboard_.set_visible(tool_.keyboard_visible);
+                full_redraw = true;   // keyboard shows/hides a big region
                 break;
             case ToolbarAction::OcrToggle:
                 tool_.ocr_enabled = !tool_.ocr_enabled;
@@ -899,12 +1128,15 @@ bool App::on_button_release(double x, double y) {
                     current_page_ = (int)note_.pages.size() - 1;
                     note_.mark_dirty();
                 }
+                full_redraw = true;
                 break;
             case ToolbarAction::PrevPage:
                 current_page_ = pages_clamp(note_, current_page_ - 1);
+                full_redraw = true;
                 break;
             case ToolbarAction::NextPage:
                 current_page_ = pages_clamp(note_, current_page_ + 1);
+                full_redraw = true;
                 break;
             case ToolbarAction::Back:
                 if (history_.can_back()) {
@@ -914,10 +1146,17 @@ bool App::on_button_release(double x, double y) {
                 } else {
                     enter_browser();
                 }
+                full_redraw = true;
                 break;
-            case ToolbarAction::Browser: enter_browser(); break;
+            case ToolbarAction::Browser: enter_browser(); full_redraw = true; break;
             case ToolbarAction::Undo:
                 if (screen_ == Screen::Markdown) markdown_undo();
+                full_redraw = true;   // markdown body changed
+                break;
+            case ToolbarAction::Hide:
+                toolbar_.set_visible(false);
+                // Only the toolbar strip changes (toolbar → page content),
+                // so leave full_redraw=false → fast partial refresh.
                 break;
             case ToolbarAction::Exit:
                 // Persist outstanding work before tearing down. The rest of
@@ -929,10 +1168,11 @@ bool App::on_button_release(double x, double y) {
                 }
                 if (note_.dirty) save_current();
                 gtk_main_quit();
-                break;
+                return true;
             default: break;
         }
-        redraw();
+        if (full_redraw) redraw();
+        else             redraw_toolbar();
         return true;
     }
     if (keyboard_.visible() && y >= keyboard_.top_y()) {
