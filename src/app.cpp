@@ -739,10 +739,18 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
         // Full-screen page; the toolbar overlays the top when visible.
         double page_w = win_w;
         double page_h = win_h;
+        // Render strokes WITHOUT antialiasing so the committed/redrawn ink
+        // matches the hard-edged live ink the inkfb fast path draws. With AA
+        // on, strokes looked jagged while drawing then "smoothed out" on the
+        // next cairo redraw — a visible, jarring change. (PDF export uses its
+        // own context and keeps AA, so exports stay smooth.) Restored to the
+        // default before the rest of the UI so text/icons still antialias.
+        cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
         if (current_page_ < (int)note_.pages.size())
             canvas_render_page(cr, note_.pages[current_page_], page_w, page_h);
         if (pen_down_ && tool_.current == Tool::Pen)
             canvas_render_stroke(cr, live_stroke_);
+        cairo_set_antialias(cr, CAIRO_ANTIALIAS_DEFAULT);
         // Lasso preview
         if (tool_.current == Tool::Lasso && lasso_.pts.size() > 1) {
             cairo_set_source_rgba(cr, 0, 0, 0, 0.6);

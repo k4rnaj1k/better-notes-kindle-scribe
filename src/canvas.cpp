@@ -9,14 +9,6 @@ namespace bn {
 
 namespace {
 
-void stroke_segment(cairo_t *cr, const Stroke &s,
-                    size_t i, size_t j, double w) {
-    cairo_set_line_width(cr, w);
-    cairo_move_to(cr, s.pts[i].x, s.pts[i].y);
-    cairo_line_to(cr, s.pts[j].x, s.pts[j].y);
-    cairo_stroke(cr);
-}
-
 void render_stroke_range(cairo_t *cr, const Stroke &s, size_t from) {
     if (s.pts.size() < 2 || from >= s.pts.size() - 1) {
         // Single dot
@@ -34,14 +26,39 @@ void render_stroke_range(cairo_t *cr, const Stroke &s, size_t from) {
     cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
     cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
     cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+
     double pmin = pen_type_pressure_min(s.pen_type);
-    for (size_t i = std::max<size_t>(from, 0); i + 1 < s.pts.size(); ++i) {
-        float pa = s.pts[i].pressure;
-        float pb = s.pts[i + 1].pressure;
-        if (pa <= 0) pa = 1.0f;
-        if (pb <= 0) pb = 1.0f;
+
+    // Quantized width of the segment starting at point i.
+    const double kQuant = 0.5;  // px buckets for batching adjacent segments
+    auto seg_w = [&](size_t i) -> double {
+        float pa = s.pts[i].pressure;     if (pa <= 0) pa = 1.0f;
+        float pb = s.pts[i + 1].pressure; if (pb <= 0) pb = 1.0f;
         double w = s.width * (pmin + (1.0 - pmin) * (double)(pa + pb) * 0.5);
-        stroke_segment(cr, s, i, i + 1, w);
+        double wq = std::round(w / kQuant) * kQuant;
+        return wq > 0 ? wq : kQuant;
+    };
+
+    // cairo_stroke is expensive per call (it builds + rasterises the stroke
+    // geometry each time), so coalesce consecutive segments that share a
+    // width into one path and stroke once. Constant-width pens collapse to a
+    // single path for the whole stroke; the pressure-tapered pencil batches
+    // runs of similar pressure. This turns the O(points) stroke calls — the
+    // dominant cost when opening notes or flipping pages — into O(width-runs).
+    size_t n = s.pts.size();
+    size_t i = std::max<size_t>(from, 0);
+    while (i + 1 < n) {
+        double wq = seg_w(i);
+        cairo_set_line_width(cr, wq);
+        cairo_move_to(cr, s.pts[i].x, s.pts[i].y);
+        cairo_line_to(cr, s.pts[i + 1].x, s.pts[i + 1].y);
+        size_t j = i + 1;
+        while (j + 1 < n && seg_w(j) == wq) {
+            cairo_line_to(cr, s.pts[j + 1].x, s.pts[j + 1].y);
+            ++j;
+        }
+        cairo_stroke(cr);
+        i = j;
     }
 }
 
