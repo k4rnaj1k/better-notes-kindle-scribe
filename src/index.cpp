@@ -206,6 +206,46 @@ IndexEntry NotesIndex::create_markdown(const std::string &title) {
     return e;
 }
 
+bool NotesIndex::remove_entry(const std::string &id) {
+    for (auto &e : entries_) {
+        if (e.id == id) {
+            if (e.is_folder) return false;   // don't recursively nuke folders
+            return remove_path(e.path);
+        }
+    }
+    return false;
+}
+
+bool NotesIndex::rename_entry(const std::string &id,
+                              const std::string &new_title) {
+    if (new_title.empty()) return false;
+    for (auto &e : entries_) {
+        if (e.id != id) continue;
+        if (e.is_folder) return false;
+        if (e.is_markdown) {
+            std::string base = slugify(new_title);
+            if (base.empty()) return false;
+            if (!ends_with(base, ".md")) base += ".md";
+            auto slash = e.path.find_last_of('/');
+            std::string dirpart =
+                (slash == std::string::npos) ? "" : e.path.substr(0, slash);
+            std::string newpath = dirpart.empty() ? base : dirpart + "/" + base;
+            if (newpath == e.path) return true;
+            if (path_exists(newpath)) return false;   // refuse to clobber
+            return rename_path(e.path, newpath);
+        }
+        // Native note: change the title inside note.json; keep the dir slug.
+        std::string nj = e.path + "/note.json";
+        std::string raw; json::Value v;
+        if (read_file(nj, raw) && json::parse(raw, v)) {
+            v.obj["title"] = json::Value::make_str(new_title);
+            return write_file(nj, json::serialize(v));
+        }
+        return false;
+    }
+    return false;
+}
+
 void NotesIndex::touch(const std::string &id, const std::string &title) {
     for (auto &e : entries_) {
         if (e.id == id) {

@@ -13,18 +13,20 @@ enum class BrowserAction {
     OpenParent,    // tap on ".." row, go up one directory
     NewNote,
     NewMarkdown,
+    Rename,        // rename the entry at entry_index
+    Delete,        // delete the entry at entry_index
 };
 
 struct BrowserHit {
     BrowserAction action = BrowserAction::None;
-    int           entry_index = -1;   // valid when action == Open
+    int           entry_index = -1;   // valid when action == Open/Rename/Delete
 };
 
 class FileBrowser {
 public:
     void layout(double w, double h, size_t entry_count);
     void draw(cairo_t *cr, const NotesIndex &idx, double w, double h);
-    BrowserHit hit(double x, double y, size_t entry_count) const;
+    BrowserHit hit(double x, double y, const NotesIndex &idx) const;
 
     void set_current_path(const std::string &p) { current_path_ = p; }
 private:

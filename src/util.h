@@ -30,6 +30,11 @@ bool ensure_dir(const std::string &path);
 std::vector<std::string> list_dir(const std::string &path);
 bool path_exists(const std::string &path);
 
+// Recursively delete a file or directory. Returns true on success.
+bool remove_path(const std::string &path);
+// Move/rename a file or directory. Returns true on success.
+bool rename_path(const std::string &from, const std::string &to);
+
 // Slugify a title into a safe directory name.
 std::string slugify(const std::string &title);
 

@@ -50,6 +50,8 @@ public:
 
     void draw_link_picker(cairo_t *cr, int win_w, int win_h);
     void draw_export_overlay(cairo_t *cr, int win_w, int win_h);  // PDF progress
+    void draw_input_modal(cairo_t *cr, int win_w, int win_h);     // rename input
+    void draw_confirm_modal(cairo_t *cr, int win_w, int win_h);   // delete confirm
     void draw_show_tab(cairo_t *cr, int win_w);   // "show toolbar" tab when hidden
     Rect show_tab_rect() const;                    // hit region for that tab
 
@@ -85,6 +87,13 @@ private:
     void save_current();
     void export_current_pdf();
     Rect export_overlay_rect() const;   // centred progress card
+
+    // Browser rename input modal.
+    void open_rename(const std::string &id, const std::string &cur_title);
+    void commit_input();   // apply the rename, close the modal
+    void close_input();    // dismiss without applying
+    Rect modal_card_rect() const;       // shared centred card geometry
+    Rect modal_btn_rect(bool primary) const;  // Save/Delete (primary) | Cancel
 
     // --- pen sample → page coordinates ---
     void map_pen_to_page(const PenSample &s, double &px, double &py);
@@ -153,6 +162,22 @@ private:
     bool          exporting_pdf_  = false;
     int           export_done_    = 0;
     int           export_total_   = 0;
+
+    // Finger-swipe page navigation (stylus draws via evdev; finger swipes
+    // here through GTK pointer events). Decided on release.
+    bool          swipe_active_   = false;
+    double        swipe_x0_       = 0;
+    double        swipe_y0_       = 0;
+
+    // Browser modals: rename (text input via the on-screen keyboard) and a
+    // delete confirmation. Only one is open at a time.
+    bool          input_open_     = false;
+    std::string   input_title_;        // modal heading, e.g. "Rename"
+    std::string   input_buf_;          // editable text
+    std::string   input_target_id_;    // entry id being renamed
+    bool          confirm_open_   = false;
+    std::string   confirm_text_;       // e.g. "Delete \"Notes\"?"
+    std::string   confirm_target_id_;
 
     // Thread plumbing
     PenReader     pen_;

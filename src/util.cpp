@@ -68,6 +68,29 @@ bool path_exists(const std::string &path) {
     struct stat st; return stat(path.c_str(), &st) == 0;
 }
 
+bool remove_path(const std::string &path) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path.c_str());
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                std::string n = e->d_name;
+                if (n == "." || n == "..") continue;
+                remove_path(path + "/" + n);
+            }
+            closedir(d);
+        }
+        return rmdir(path.c_str()) == 0;
+    }
+    return unlink(path.c_str()) == 0;
+}
+
+bool rename_path(const std::string &from, const std::string &to) {
+    return std::rename(from.c_str(), to.c_str()) == 0;
+}
+
 std::string slugify(const std::string &title) {
     std::string out; out.reserve(title.size());
     for (char c : title) {

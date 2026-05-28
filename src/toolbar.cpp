@@ -269,8 +269,8 @@ void Toolbar::layout(double width) {
 }
 
 Rect Toolbar::pen_menu_item_rect(int i) const {
-    double iw = std::max(pen_btn_rect_.w, 240.0);
-    double ih = 76.0;
+    double iw = std::max(pen_btn_rect_.w, 320.0);
+    double ih = 96.0;
     return Rect{pen_btn_rect_.x, height_ + i * ih, iw, ih};
 }
 
@@ -349,19 +349,19 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
             cairo_set_source_rgb(cr, fg, fg, fg);
             cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
             cairo_set_line_width(cr, std::min(pp.width, r.h * 0.4));
-            cairo_move_to(cr, r.x + 18, cy);
-            cairo_line_to(cr, r.x + 62, cy);
+            cairo_move_to(cr, r.x + 22, cy);
+            cairo_line_to(cr, r.x + 78, cy);
             cairo_stroke(cr);
 
             PangoLayout *il = pango_cairo_create_layout(cr);
             PangoFontDescription *ifd =
-                pango_font_description_from_string("Sans 15");
+                pango_font_description_from_string("Sans 20");
             pango_layout_set_font_description(il, ifd);
             pango_font_description_free(ifd);
             pango_layout_set_text(il, pp.name, -1);
             int tw, th; pango_layout_get_pixel_size(il, &tw, &th);
             (void)tw;
-            cairo_move_to(cr, r.x + 78, cy - th / 2.0);
+            cairo_move_to(cr, r.x + 96, cy - th / 2.0);
             pango_cairo_show_layout(cr, il);
             g_object_unref(il);
         }

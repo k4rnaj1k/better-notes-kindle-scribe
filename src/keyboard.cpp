@@ -11,18 +11,26 @@ const char *ROW2[] = {"q","w","e","r","t","y","u","i","o","p"};
 const char *ROW3[] = {"a","s","d","f","g","h","j","k","l"};
 const char *ROW4[] = {"z","x","c","v","b","n","m",",",".","?"};
 
+// Markdown formatting row: label differs from the inserted text. Labels are
+// kept ASCII so the Kindle's older Pango never drops a glyph.
+struct MdKey { const char *label; const char *out; };
+const MdKey MDROW[] = {
+    {"H1","# "}, {"H2","## "}, {"H3","### "}, {"B","**"},   {"I","*"},
+    {"Code","`"},{"List","- "},{"1.","1. "},  {"Quote","> "},{"Link","[]()"},
+};
+
 } // namespace
 
 void Keyboard::layout(double w, double h) {
     w_ = w; h_ = h;
-    double kh    = 64.0;
-    double rows  = 5;
+    double kh    = 80.0;
+    double rows  = 6;          // markdown row + 4 letter rows + space row
     double total_h = rows * kh + 8;
     top_y_ = h - total_h;
     keys_.clear();
 
+    double margin = 8.0;
     auto add_row = [&](const char **labels, int n, double y) {
-        double margin = 8.0;
         double kw = (w_ - 2 * margin - (n - 1) * 4) / (double)n;
         for (int i = 0; i < n; ++i) {
             Key k;
@@ -35,14 +43,31 @@ void Keyboard::layout(double w, double h) {
             keys_.push_back(k);
         }
     };
-    add_row(ROW1, 10, top_y_ + 4);
-    add_row(ROW2, 10, top_y_ + 4 + kh);
-    add_row(ROW3, 9,  top_y_ + 4 + 2 * kh);
-    add_row(ROW4, 10, top_y_ + 4 + 3 * kh);
+
+    // Markdown formatting row at the top.
+    {
+        int n = (int)(sizeof(MDROW) / sizeof(MDROW[0]));
+        double kw = (w_ - 2 * margin - (n - 1) * 4) / (double)n;
+        double y = top_y_ + 4;
+        for (int i = 0; i < n; ++i) {
+            Key k;
+            k.r.x = margin + i * (kw + 4);
+            k.r.y = y;
+            k.r.w = kw;
+            k.r.h = kh - 6;
+            k.label  = MDROW[i].label;
+            k.output = MDROW[i].out;
+            keys_.push_back(k);
+        }
+    }
+
+    add_row(ROW1, 10, top_y_ + 4 + kh);
+    add_row(ROW2, 10, top_y_ + 4 + 2 * kh);
+    add_row(ROW3, 9,  top_y_ + 4 + 3 * kh);
+    add_row(ROW4, 10, top_y_ + 4 + 4 * kh);
 
     // Last row: Shift, Space, Backspace, Enter
-    double y = top_y_ + 4 + 4 * kh;
-    double margin = 8.0;
+    double y = top_y_ + 4 + 5 * kh;
     double remain = w_ - 2 * margin;
     Key shift{{margin, y, remain * 0.15, kh - 6}, "Shift", "Shift"};
     Key space{{margin + remain * 0.18, y, remain * 0.40, kh - 6}, "Space", " "};
@@ -63,7 +88,7 @@ void Keyboard::draw(cairo_t *cr) {
     cairo_move_to(cr, 0, top_y_); cairo_line_to(cr, w_, top_y_);
     cairo_stroke(cr);
 
-    PangoFontDescription *fd = pango_font_description_from_string("Sans 18");
+    PangoFontDescription *fd = pango_font_description_from_string("Sans 22");
     for (size_t i = 0; i < keys_.size(); ++i) {
         const Key &k = keys_[i];
         bool down = (int)i == pressed_idx_;

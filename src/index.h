@@ -47,6 +47,15 @@ public:
     // Refresh updated_ms / title for one note after save.
     void touch(const std::string &id, const std::string &title);
 
+    // Delete the entry with this id from disk (recursively for note dirs).
+    // Caller should re-open() afterwards to refresh the listing.
+    bool remove_entry(const std::string &id);
+
+    // Rename the entry. Markdown files are renamed on disk (slugified +
+    // ".md"); native notes keep their directory but get the new title written
+    // into note.json. Folders are left untouched. Re-open() afterwards.
+    bool rename_entry(const std::string &id, const std::string &new_title);
+
     bool save() const;
 private:
     void scan_dir(const std::string &abs_dir, const std::string &rel_prefix);

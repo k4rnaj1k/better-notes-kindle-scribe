@@ -192,12 +192,23 @@ int App::run(int argc, char *argv[]) {
     gtk_widget_show_all(window_);
 
     keyboard_.on_text([this](const std::string &t){
+        if (input_open_) { input_buf_ += t; redraw(); return; }
         if (screen_ == Screen::Markdown) {
             markdown_insert(t);
             redraw();
         }
     });
     keyboard_.on_key([this](const std::string &k){
+        if (input_open_) {
+            if (k == "Backspace") {
+                if (!input_buf_.empty()) input_buf_.pop_back();
+            } else if (k == "Enter") {
+                commit_input();   // applies rename + redraws
+                return;
+            }
+            redraw();
+            return;
+        }
         if (screen_ != Screen::Markdown) return;
         if (k == "Backspace") {
             markdown_backspace();
@@ -682,6 +693,144 @@ void App::draw_export_overlay(cairo_t *cr, int win_w, int win_h) {
     cairo_rectangle(cr, bx, by, bw, bh); cairo_stroke(cr);
 }
 
+// --- Browser modals (rename input / delete confirm) ---
+
+Rect App::modal_card_rect() const {
+    double cw = std::min(560.0, win_w_ * 0.8);
+    double ch = 240.0;
+    double cx = (win_w_ - cw) / 2.0;
+    double cy = 160.0;   // near the top, leaving room for the keyboard below
+    return Rect{cx, cy, cw, ch};
+}
+
+Rect App::modal_btn_rect(bool primary) const {
+    Rect c = modal_card_rect();
+    double bw = 150, bh = 60, gap = 20, m = 24;
+    double by = c.y + c.h - bh - m;
+    double px = primary ? (c.x + c.w - m - bw)             // right: Save/Delete
+                        : (c.x + c.w - m - 2 * bw - gap);  // left:  Cancel
+    return Rect{px, by, bw, bh};
+}
+
+void App::open_rename(const std::string &id, const std::string &cur_title) {
+    input_open_      = true;
+    input_title_     = "Rename";
+    input_buf_       = cur_title;
+    input_target_id_ = id;
+    keyboard_.set_visible(true);
+    redraw();
+}
+
+void App::commit_input() {
+    std::string id = input_target_id_, name = input_buf_;
+    close_input();
+    if (!id.empty() && !name.empty()) index_.rename_entry(id, name);
+    enter_browser();   // rescans the dir + redraws
+}
+
+void App::close_input() {
+    input_open_ = false;
+    input_buf_.clear();
+    input_target_id_.clear();
+    keyboard_.set_visible(false);
+    redraw();
+}
+
+namespace {
+void modal_button(cairo_t *cr, const Rect &r, const char *label, bool primary) {
+    cairo_set_source_rgb(cr, primary ? 0.20 : 0.90,
+                             primary ? 0.20 : 0.90,
+                             primary ? 0.20 : 0.90);
+    cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_stroke(cr);
+
+    PangoLayout *l = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string("Sans 18");
+    pango_layout_set_font_description(l, fd);
+    pango_font_description_free(fd);
+    pango_layout_set_text(l, label, -1);
+    int tw, th; pango_layout_get_pixel_size(l, &tw, &th);
+    double fg = primary ? 0.95 : 0.12;
+    cairo_set_source_rgb(cr, fg, fg, fg);
+    cairo_move_to(cr, r.x + (r.w - tw) / 2.0, r.y + (r.h - th) / 2.0);
+    pango_cairo_show_layout(cr, l);
+    g_object_unref(l);
+}
+}  // namespace
+
+void App::draw_input_modal(cairo_t *cr, int win_w, int win_h) {
+    (void)win_w; (void)win_h;
+    Rect c = modal_card_rect();
+    cairo_set_source_rgb(cr, 0.98, 0.98, 0.98);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+    cairo_set_line_width(cr, 2.0);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_stroke(cr);
+
+    PangoFontDescription *fd = pango_font_description_from_string("Sans Bold 22");
+    PangoLayout *t = pango_cairo_create_layout(cr);
+    pango_layout_set_font_description(t, fd);
+    pango_layout_set_text(t, input_title_.c_str(), -1);
+    cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+    cairo_move_to(cr, c.x + 24, c.y + 18);
+    pango_cairo_show_layout(cr, t);
+    g_object_unref(t);
+    pango_font_description_free(fd);
+
+    // Editable text field with a trailing cursor bar.
+    Rect f{c.x + 24, c.y + 74, c.w - 48, 56};
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_rectangle(cr, f.x, f.y, f.w, f.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, f.x, f.y, f.w, f.h); cairo_stroke(cr);
+
+    std::string shown = input_buf_ + "|";
+    PangoFontDescription *ffd = pango_font_description_from_string("Sans 20");
+    PangoLayout *fl = pango_cairo_create_layout(cr);
+    pango_layout_set_font_description(fl, ffd);
+    pango_layout_set_text(fl, shown.c_str(), -1);
+    int tw, th; pango_layout_get_pixel_size(fl, &tw, &th);
+    (void)tw;
+    cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+    cairo_move_to(cr, f.x + 12, f.y + (f.h - th) / 2.0);
+    pango_cairo_show_layout(cr, fl);
+    g_object_unref(fl);
+    pango_font_description_free(ffd);
+
+    modal_button(cr, modal_btn_rect(true),  "Save",   true);
+    modal_button(cr, modal_btn_rect(false), "Cancel", false);
+}
+
+void App::draw_confirm_modal(cairo_t *cr, int win_w, int win_h) {
+    // Dim the screen behind the confirm card.
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
+    cairo_rectangle(cr, 0, 0, win_w, win_h); cairo_fill(cr);
+
+    Rect c = modal_card_rect();
+    cairo_set_source_rgb(cr, 0.98, 0.98, 0.98);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+    cairo_set_line_width(cr, 2.0);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_stroke(cr);
+
+    PangoFontDescription *fd = pango_font_description_from_string("Sans 22");
+    PangoLayout *t = pango_cairo_create_layout(cr);
+    pango_layout_set_font_description(t, fd);
+    pango_layout_set_width(t, (int)((c.w - 48) * PANGO_SCALE));
+    pango_layout_set_text(t, confirm_text_.c_str(), -1);
+    cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+    cairo_move_to(cr, c.x + 24, c.y + 36);
+    pango_cairo_show_layout(cr, t);
+    g_object_unref(t);
+    pango_font_description_free(fd);
+
+    modal_button(cr, modal_btn_rect(true),  "Delete", true);
+    modal_button(cr, modal_btn_rect(false), "Cancel", false);
+}
+
 void App::set_rotation(int deg) {
     deg = ((deg % 360) + 360) % 360;
     if (deg != 0 && deg != 90 && deg != 180 && deg != 270) deg = 0;
@@ -731,6 +880,14 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
     if (screen_ == Screen::Browser) {
         browser_.layout(win_w, win_h, index_.entries().size());
         browser_.draw(cr, index_, win_w, win_h);
+        // Rename input modal (with on-screen keyboard) / delete confirm sit
+        // on top of the browser.
+        if (input_open_) {
+            keyboard_.layout(win_w, win_h);
+            keyboard_.draw(cr);
+            draw_input_modal(cr, win_w, win_h);
+        }
+        if (confirm_open_) draw_confirm_modal(cr, win_w, win_h);
         return;
     }
 
@@ -996,20 +1153,56 @@ bool App::on_button_press(double x, double y) {
     if (toolbar_.pen_menu_open()) return true;
 
     if (screen_ == Screen::Browser) {
-        BrowserHit h = browser_.hit(x, y, index_.entries().size());
-        if (h.action == BrowserAction::NewNote) {
-            auto e = index_.create_note("Untitled", TemplateId::Blank);
-            enter_note(e.id);
-        } else if (h.action == BrowserAction::NewMarkdown) {
-            auto e = index_.create_markdown("untitled");
-            enter_markdown(e.path);
-        } else if (h.action == BrowserAction::OpenParent) {
-            enter_parent_folder();
-        } else if (h.action == BrowserAction::Open && h.entry_index >= 0) {
-            const auto &e = index_.entries()[h.entry_index];
-            if (e.is_folder)        enter_folder(e.id);
-            else if (e.is_markdown) enter_markdown(e.path);
-            else                    enter_note(e.id);
+        // Modals are acted on release; here we just swallow the press (and
+        // give the keyboard its press feedback when the rename modal is open).
+        if (confirm_open_) return true;
+        if (input_open_) {
+            if (keyboard_.visible() && y >= keyboard_.top_y()) {
+                keyboard_.press(x, y);
+                redraw_rect(0, keyboard_.top_y(),
+                            (double)win_w_, (double)win_h_ - keyboard_.top_y());
+            }
+            return true;
+        }
+        BrowserHit h = browser_.hit(x, y, index_);
+        switch (h.action) {
+            case BrowserAction::NewNote: {
+                auto e = index_.create_note("Untitled", TemplateId::Blank);
+                enter_note(e.id);
+                break;
+            }
+            case BrowserAction::NewMarkdown: {
+                auto e = index_.create_markdown("untitled");
+                enter_markdown(e.path);
+                break;
+            }
+            case BrowserAction::OpenParent:
+                enter_parent_folder();
+                break;
+            case BrowserAction::Open:
+                if (h.entry_index >= 0) {
+                    const auto &e = index_.entries()[h.entry_index];
+                    if (e.is_folder)        enter_folder(e.id);
+                    else if (e.is_markdown) enter_markdown(e.path);
+                    else                    enter_note(e.id);
+                }
+                break;
+            case BrowserAction::Rename:
+                if (h.entry_index >= 0) {
+                    const auto &e = index_.entries()[h.entry_index];
+                    open_rename(e.id, e.title);
+                }
+                break;
+            case BrowserAction::Delete:
+                if (h.entry_index >= 0) {
+                    const auto &e = index_.entries()[h.entry_index];
+                    confirm_open_      = true;
+                    confirm_target_id_ = e.id;
+                    confirm_text_      = "Delete \"" + e.title + "\"?";
+                    redraw();
+                }
+                break;
+            default: break;
         }
         return true;
     }
@@ -1043,20 +1236,62 @@ bool App::on_button_press(double x, double y) {
         return true;
     }
 
-    // Tap-to-follow inside a link rect (Pen tool, single tap). Page coords
-    // == screen coords now, so the tap maps directly.
-    if (screen_ == Screen::NoteView && tool_.current == Tool::Pen) {
-        const Link *l = link_at(note_, current_page_, x, y);
-        if (l) {
-            // Resolve against the vault — handles bare names ("MyNote"),
-            // sub-folder paths ("work/meeting"), .md vs note-dir, and
-            // case/slug fuzzy matching like Obsidian.
-            std::string resolved = index_.resolve_link(l->target);
-            if (!resolved.empty()) {
+    // NoteView canvas: begin a potential finger swipe for page navigation.
+    // The stylus draws through the evdev path, so these GTK pointer events are
+    // finger input. Swipe-vs-tap (tap = follow a link) is decided on release.
+    if (screen_ == Screen::NoteView) {
+        swipe_active_ = true;
+        swipe_x0_ = x;
+        swipe_y0_ = y;
+    }
+    return true;
+}
+
+bool App::on_button_release(double x, double y) {
+    if (exporting_pdf_) return true;
+
+    if (screen_ == Screen::Browser) {
+        if (confirm_open_) {
+            if (modal_btn_rect(true).contains(x, y)) {          // Delete
+                index_.remove_entry(confirm_target_id_);
+                confirm_open_ = false;
+                enter_browser();                                // rescan + redraw
+            } else {                                            // Cancel / outside
+                confirm_open_ = false;
+                redraw();
+            }
+            return true;
+        }
+        if (input_open_) {
+            if (keyboard_.visible() && y >= keyboard_.top_y()) {
+                keyboard_.release(x, y);   // dispatches via on_text/on_key
+                redraw();
+                return true;
+            }
+            if (modal_btn_rect(true).contains(x, y))       commit_input();  // Save
+            else if (modal_btn_rect(false).contains(x, y)) close_input();   // Cancel
+            return true;
+        }
+        return true;
+    }
+
+    // NoteView finger gesture: a horizontal swipe flips the page, a tap
+    // follows a link. swipe_active_ is only set for canvas presses, so this
+    // can't be confused with toolbar/keyboard taps.
+    if (screen_ == Screen::NoteView && swipe_active_) {
+        swipe_active_ = false;
+        double dx = x - swipe_x0_, dy = y - swipe_y0_;
+        const double SWIPE_MIN = 120.0;
+        if (std::fabs(dx) > SWIPE_MIN && std::fabs(dx) > 2.0 * std::fabs(dy)) {
+            int np = pages_clamp(note_, current_page_ + (dx < 0 ? 1 : -1));
+            if (np != current_page_) { current_page_ = np; redraw(); }
+        } else if (tool_.current == Tool::Pen) {
+            const Link *l = link_at(note_, current_page_, x, y);
+            if (l) {
+                std::string resolved = index_.resolve_link(l->target);
                 struct stat st;
-                if (stat(resolved.c_str(), &st) == 0) {
+                if (!resolved.empty() && stat(resolved.c_str(), &st) == 0) {
                     if (S_ISDIR(st.st_mode)) {
-                        // Native note dir — derive vault-relative id.
                         std::string rel = resolved;
                         if (rel.rfind(notes_dir_ + "/", 0) == 0)
                             rel = rel.substr(notes_dir_.size() + 1);
@@ -1066,15 +1301,9 @@ bool App::on_button_press(double x, double y) {
                     }
                 }
             }
-            return true;
         }
+        return true;
     }
-    return true;
-}
-
-bool App::on_button_release(double x, double y) {
-    if (exporting_pdf_) return true;
-    if (screen_ == Screen::Browser) return true;
 
     // Toolbar hidden: the only chrome is the show-tab. Reveal it here on
     // release (the toolbar is still hidden at this point, so this release
