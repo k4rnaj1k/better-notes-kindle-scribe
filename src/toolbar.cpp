@@ -44,10 +44,12 @@ void draw_button(cairo_t *cr, const ToolbarButton &b,
 
 void Toolbar::layout(double width) {
     width_  = width;
-    height_ = 84.0;
+    // Buttons sized for finger taps on the Scribe — minimum ~120 px square
+    // is a comfortable target. Was 92×64; now 120×100.
+    height_ = 120.0;
     const double m = 10.0;
-    const double bw = 92.0, bh = height_ - 2 * m;
-    const double gap = 6.0;
+    const double bw = 120.0, bh = height_ - 2 * m;
+    const double gap = 8.0;
     buttons_.clear();
     auto add = [&](const char *label, ToolbarAction a) {
         ToolbarButton b{};
@@ -64,6 +66,7 @@ void Toolbar::layout(double width) {
     add("Lasso",               ToolbarAction::Lasso);
     add("Keyb",                ToolbarAction::Keyboard);
     add("OCR",                 ToolbarAction::OcrToggle);
+    add("Undo",                ToolbarAction::Undo);
     add("Save",                ToolbarAction::Save);
     add("PDF",                 ToolbarAction::ExportPdf);
     add("+ Page",              ToolbarAction::AddPage);
@@ -106,12 +109,12 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
             case ToolbarAction::OcrToggle: active = st.ocr_enabled; break;
             default: break;
         }
-        draw_button(cr, b, active, 14);
+        draw_button(cr, b, active, 18);
     }
 
     // Status pill: tool name + page n/N
     PangoLayout *layout = pango_cairo_create_layout(cr);
-    PangoFontDescription *fd = pango_font_description_from_string("Sans 12");
+    PangoFontDescription *fd = pango_font_description_from_string("Sans 14");
     pango_layout_set_font_description(layout, fd);
     pango_font_description_free(fd);
     char buf[128];
@@ -120,7 +123,7 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
                   status.c_str());
     pango_layout_set_text(layout, buf, -1);
     cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
-    cairo_move_to(cr, 12, height_ + 4);
+    cairo_move_to(cr, 12, height_ + 6);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
 }

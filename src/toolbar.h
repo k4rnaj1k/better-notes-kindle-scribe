@@ -22,6 +22,7 @@ enum class ToolbarAction {
     NextPage,
     Back,
     Browser,
+    Undo,   // only meaningful in Markdown screen for now
 };
 
 struct ToolbarButton {

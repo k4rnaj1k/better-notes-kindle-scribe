@@ -39,6 +39,7 @@ sources = files(
   'src/util.cpp',
   'src/ocr.cpp',
   'src/json.cpp',
+  'src/inkfb.cpp',
 )
 
 deps = [gtk2, pangocairo]

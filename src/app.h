@@ -1,6 +1,7 @@
 #pragma once
 #include "filebrowser.h"
 #include "index.h"
+#include "inkfb.h"
 #include "keyboard.h"
 #include "lasso.h"
 #include "links.h"
@@ -16,10 +17,21 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace bn {
 
 enum class Screen { Browser, NoteView, Markdown };
+
+// Modal that appears after a lasso closes; user picks the target note.
+struct LinkPicker {
+    bool   open = false;
+    Rect   anchor;          // rect on the current page where the link will sit
+    int    page = -1;
+    int    scroll = 0;      // first visible entry
+    std::vector<IndexEntry> entries;  // snapshot of vault at picker open time
+};
 
 class App {
 public:
@@ -36,6 +48,15 @@ public:
     bool on_button_release(double x, double y);
     bool on_motion(double x, double y);
 
+    void draw_link_picker(cairo_t *cr, int win_w, int win_h);
+    void handle_picker_press(double x, double y);
+
+    // Markdown helpers
+    void markdown_snapshot();
+    void markdown_undo();
+    void markdown_insert(const std::string &text);
+    void markdown_backspace();
+
     // Called from pen_reader thread; just enqueues onto pen_queue_.
     void on_pen_sample(const PenSample &s);
 
@@ -47,6 +68,8 @@ private:
 
     // --- screen routing ---
     void enter_browser();
+    void enter_folder(const std::string &rel_path);  // descends in vault
+    void enter_parent_folder();                       // ".." navigation
     void enter_note(const std::string &id);
     void enter_markdown(const std::string &path);
 
@@ -60,11 +83,29 @@ private:
     void redraw();
     void redraw_rect(double x, double y, double w, double h);
 
+    // Software rotation. The Kindle's X server doesn't support XRandR, so
+    // we pre-rotate the cairo context and inverse-rotate input events.
+    // 0 / 90 / 180 / 270 are supported. Default 90 = portrait on Scribe.
+    int  rotation_deg() const { return rotation_; }
+    void set_rotation(int deg);
+
+    // Drawing-space dimensions (after rotation). For 90/270, w/h are
+    // swapped relative to the X window allocation.
+    int  draw_w() const { return (rotation_ == 90 || rotation_ == 270) ? xh_ : xw_; }
+    int  draw_h() const { return (rotation_ == 90 || rotation_ == 270) ? xw_ : xh_; }
+
+    // X11 window coords → drawing-space coords (inverse of the cairo
+    // rotation applied in on_draw).
+    void screen_to_drawing(double sx, double sy, double &dx, double &dy) const;
+
     // --- state ---
     GtkWidget    *window_  = nullptr;
     GtkWidget    *canvas_  = nullptr;
-    int           win_w_   = 0;
+    int           xw_      = 0;     // raw X11 window size (landscape on Scribe)
+    int           xh_      = 0;
+    int           win_w_   = 0;     // post-rotation drawing-space size (portrait)
     int           win_h_   = 0;
+    int           rotation_ = 90;   // degrees CW for portrait on Scribe
 
     Screen        screen_  = Screen::Browser;
     ToolState     tool_;
@@ -75,16 +116,23 @@ private:
     NavHistory    history_;
 
     NotesIndex    index_;
+    std::string   browser_path_;     // vault-relative dir the browser is showing
     Note          note_;             // currently-open note
     int           current_page_ = 0;
     std::string   markdown_path_;
     std::string   markdown_buf_;
     bool          markdown_dirty_ = false;
+    size_t        markdown_cursor_ = 0;             // byte offset into buf
+    std::vector<std::pair<std::string, size_t>>
+                  markdown_history_;                // (buf, cursor) snapshots for undo
 
     // Pen capture state
     Stroke        live_stroke_;
     bool          pen_down_       = false;
     PenButton     active_button_  = PenButton::None;
+    InkRect       live_ink_bbox_  = {0, 0, 0, 0};   // union of A2 updates for current stroke
+
+    LinkPicker    picker_;
 
     // Thread plumbing
     PenReader     pen_;

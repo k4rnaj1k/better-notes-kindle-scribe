@@ -8,6 +8,7 @@
 // Compiled out (becomes a no-op) when BN_HAVE_TESSERACT is not defined.
 
 #include "strokes.h"
+#include "util.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -15,14 +16,19 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace bn {
 
 struct OcrResult {
     std::string text;
     int         page = 0;
-    // Optional: wiki-link candidates ([[name]]) extracted from text.
+    // Wiki-link candidates ([[name]]) extracted from text.
     std::vector<std::string> wiki_links;
+    // Bounding rect for each wiki_links entry, page-coordinate space.
+    // Same length as wiki_links when Tesseract's GetIterator() found the
+    // word; empty rects (w=0) signal "fall back to placeholder".
+    std::vector<Rect>        word_rects;
 };
 
 class Ocr {

@@ -34,25 +34,49 @@ void FileBrowser::draw(cairo_t *cr, const NotesIndex &idx,
     // Header
     cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
     cairo_rectangle(cr, 0, 0, w_, header_h_); cairo_fill(cr);
-    draw_text(cr, 16, 18, "BetterNotes", "Sans Bold 28", 0.1, 0.1, 0.1);
+    draw_text(cr, 20, 26, "BetterNotes", "Sans Bold 32", 0.1, 0.1, 0.1);
+
+    // Breadcrumb path (relative to vault root) under the title
+    if (!current_path_.empty()) {
+        std::string crumb = "/" + current_path_;
+        draw_text(cr, 20, 70, crumb.c_str(), "Sans 16", 0.35, 0.35, 0.35);
+    }
 
     // Buttons: New note (right), New markdown
-    double bw = 160, bh = 50, m = 16;
+    double bw = 210, bh = 80, m = 16;
+    double btn_y = (header_h_ - bh) / 2.0;
     cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
-    cairo_rectangle(cr, w_ - m - bw,       m + 4, bw, bh); cairo_fill(cr);
-    cairo_rectangle(cr, w_ - m - 2*bw - 10, m + 4, bw, bh); cairo_fill(cr);
+    cairo_rectangle(cr, w_ - m - bw,           btn_y, bw, bh); cairo_fill(cr);
+    cairo_rectangle(cr, w_ - m - 2*bw - 10,    btn_y, bw, bh); cairo_fill(cr);
     cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
     cairo_set_line_width(cr, 1.5);
-    cairo_rectangle(cr, w_ - m - bw,       m + 4, bw, bh); cairo_stroke(cr);
-    cairo_rectangle(cr, w_ - m - 2*bw - 10, m + 4, bw, bh); cairo_stroke(cr);
-    draw_text(cr, w_ - m - bw + 22,       m + 16,
-              "+ New note",     "Sans Bold 16", 0.1, 0.1, 0.1);
-    draw_text(cr, w_ - m - 2*bw - 10 + 12, m + 16,
-              "+ New markdown", "Sans Bold 14", 0.1, 0.1, 0.1);
+    cairo_rectangle(cr, w_ - m - bw,           btn_y, bw, bh); cairo_stroke(cr);
+    cairo_rectangle(cr, w_ - m - 2*bw - 10,    btn_y, bw, bh); cairo_stroke(cr);
+    draw_text(cr, w_ - m - bw + 26,            btn_y + 26,
+              "+ New note",     "Sans Bold 20", 0.1, 0.1, 0.1);
+    draw_text(cr, w_ - m - 2*bw - 10 + 14,     btn_y + 26,
+              "+ New markdown", "Sans Bold 18", 0.1, 0.1, 0.1);
 
-    // Entry list
+    // Entry list — parent-folder row, then folders, then files
     auto &entries = idx.entries();
     double y = header_h_ + 6;
+
+    // Parent ".." row when we're below the vault root
+    if (!current_path_.empty()) {
+        if (y + row_h_ <= h_) {
+            cairo_set_source_rgb(cr, 0.5, 0.5, 0.5);
+            cairo_set_line_width(cr, 0.5);
+            cairo_move_to(cr, 16, y + row_h_);
+            cairo_line_to(cr, w_ - 16, y + row_h_);
+            cairo_stroke(cr);
+            draw_text(cr, 20, y + 20, "DIR ",
+                      "Sans Bold 14", 0.4, 0.4, 0.4);
+            draw_text(cr, 70, y + 14, "..   (parent)",
+                      "Sans 22", 0.1, 0.1, 0.1);
+            y += row_h_;
+        }
+    }
+
     for (size_t i = 0; i < entries.size(); ++i) {
         if (y + row_h_ > h_) break;
         cairo_set_source_rgb(cr, 0.5, 0.5, 0.5);
@@ -61,24 +85,35 @@ void FileBrowser::draw(cairo_t *cr, const NotesIndex &idx,
         cairo_line_to(cr, w_ - 16, y + row_h_);
         cairo_stroke(cr);
 
-        const char *tag = entries[i].is_markdown ? "MD  " : "    ";
-        draw_text(cr, 16, y + 12, tag, "Sans Bold 12", 0.4, 0.4, 0.4);
-        draw_text(cr, 60, y + 8, entries[i].title.c_str(),
-                  "Sans 18", 0.1, 0.1, 0.1);
+        const char *tag = entries[i].is_folder    ? "DIR "
+                        : entries[i].is_markdown  ? "MD  "
+                        :                            "NOTE";
+        draw_text(cr, 20, y + 20, tag, "Sans Bold 14", 0.4, 0.4, 0.4);
+        draw_text(cr, 70, y + 14, entries[i].title.c_str(),
+                  "Sans 22", 0.1, 0.1, 0.1);
         y += row_h_;
     }
 }
 
 BrowserHit FileBrowser::hit(double x, double y, size_t entry_count) const {
-    double bw = 160, bh = 50, m = 16;
-    if (y >= m + 4 && y <= m + 4 + bh) {
+    double bw = 210, bh = 80, m = 16;
+    double btn_y = (header_h_ - bh) / 2.0;
+    if (y >= btn_y && y <= btn_y + bh) {
         if (x >= w_ - m - bw && x <= w_ - m) return {BrowserAction::NewNote, -1};
         if (x >= w_ - m - 2*bw - 10 && x <= w_ - m - bw - 10)
             return {BrowserAction::NewMarkdown, -1};
     }
     if (y < header_h_) return {};
+
     int row = (int)((y - header_h_ - 6) / row_h_);
-    if (row < 0 || row >= (int)entry_count) return {};
+    if (row < 0) return {};
+
+    // Adjust for the optional ".." parent row at the top of the list.
+    if (!current_path_.empty()) {
+        if (row == 0) return {BrowserAction::OpenParent, -1};
+        row -= 1;
+    }
+    if (row >= (int)entry_count) return {};
     return {BrowserAction::Open, row};
 }
 

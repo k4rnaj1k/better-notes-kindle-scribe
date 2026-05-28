@@ -7,8 +7,11 @@
 
 #if BN_HAVE_TESSERACT
 #include <tesseract/baseapi.h>
+#include <tesseract/resultiterator.h>
 #include <leptonica/allheaders.h>
 #endif
+
+#include <unordered_map>
 
 namespace bn {
 
@@ -127,6 +130,44 @@ void Ocr::run_once(const Note &n, int page, int w_px, int h_px) {
     if (text) r.text = text;
     r.wiki_links = extract_wiki_links(r.text);
     delete[] text;
+
+    // Build a map word_text → bbox so we can attach a real rect to each
+    // [[wiki-link]] target. Tesseract's iterator yields words in reading
+    // order; we keep the first occurrence (good enough for now).
+    std::unordered_map<std::string, Rect> word_rects;
+    tesseract::ResultIterator *it = tess->GetIterator();
+    if (it) {
+        do {
+            const char *w = it->GetUTF8Text(tesseract::RIL_WORD);
+            if (w && *w) {
+                int x0, y0, x1, y1;
+                if (it->BoundingBox(tesseract::RIL_WORD, &x0, &y0, &x1, &y1)) {
+                    Rect rect;
+                    rect.x = (double)x0;
+                    rect.y = (double)y0;
+                    rect.w = (double)(x1 - x0);
+                    rect.h = (double)(y1 - y0);
+                    word_rects.emplace(w, rect);
+                }
+            }
+            delete[] w;
+        } while (it->Next(tesseract::RIL_WORD));
+        delete it;
+    }
+    // For each [[name]] candidate, look up the first matching word; the
+    // link rect can later be expanded to span all the words in the name.
+    r.word_rects.reserve(r.wiki_links.size());
+    for (auto &name : r.wiki_links) {
+        Rect rect{};
+        // Try the first word of the wiki-link name.
+        auto first_word_end = name.find(' ');
+        std::string first = (first_word_end == std::string::npos)
+                            ? name : name.substr(0, first_word_end);
+        auto it_rect = word_rects.find(first);
+        if (it_rect != word_rects.end()) rect = it_rect->second;
+        r.word_rects.push_back(rect);
+    }
+
     cairo_surface_destroy(surf);
     if (cb_) cb_(r);
 #else
