@@ -2,10 +2,15 @@
 #include "strokes.h"
 
 #include <cairo/cairo.h>
+#include <string>
 
 namespace bn {
 
-// Render a finished page: template underlay + every stored stroke.
+// Vault root used to resolve a page's custom-template `bg_image` (stored
+// vault-relative, e.g. "templates/foo.png"). Set once at startup.
+void canvas_set_vault_root(const std::string &root);
+
+// Render a finished page: template/background underlay + every stored stroke.
 void canvas_render_page(cairo_t *cr, const Page &p, double w, double h);
 
 // Render a single stroke (used for live preview and replay).

@@ -24,7 +24,7 @@ const MdKey MDROW[] = {
 void Keyboard::layout(double w, double h) {
     w_ = w; h_ = h;
     double kh    = 80.0;
-    double rows  = 6;          // markdown row + 4 letter rows + space row
+    double rows  = 7;          // markdown + nav + 4 letter rows + space row
     double total_h = rows * kh + 8;
     top_y_ = h - total_h;
     keys_.clear();
@@ -66,8 +66,27 @@ void Keyboard::layout(double w, double h) {
     add_row(ROW3, 9,  top_y_ + 4 + 3 * kh);
     add_row(ROW4, 10, top_y_ + 4 + 4 * kh);
 
+    // Cursor navigation row. Labels are ASCII words so the Kindle's older
+    // Pango never drops a glyph; outputs match App's markdown key handler.
+    {
+        const char *nav[] = {"Home", "Left", "Up", "Down", "Right", "End"};
+        int n = (int)(sizeof(nav) / sizeof(nav[0]));
+        double kw = (w_ - 2 * margin - (n - 1) * 4) / (double)n;
+        double y = top_y_ + 4 + 5 * kh;
+        for (int i = 0; i < n; ++i) {
+            Key k;
+            k.r.x = margin + i * (kw + 4);
+            k.r.y = y;
+            k.r.w = kw;
+            k.r.h = kh - 6;
+            k.label  = nav[i];
+            k.output = nav[i];
+            keys_.push_back(k);
+        }
+    }
+
     // Last row: Shift, Space, Backspace, Enter
-    double y = top_y_ + 4 + 5 * kh;
+    double y = top_y_ + 4 + 6 * kh;
     double remain = w_ - 2 * margin;
     Key shift{{margin, y, remain * 0.15, kh - 6}, "Shift", "Shift"};
     Key space{{margin + remain * 0.18, y, remain * 0.40, kh - 6}, "Space", " "};
@@ -140,7 +159,10 @@ bool Keyboard::release(double x, double y) {
 
     if (k.output == "Shift") {
         shift_ = !shift_;
-    } else if (k.output == "Backspace" || k.output == "Enter") {
+    } else if (k.output == "Backspace" || k.output == "Enter" ||
+               k.output == "Left" || k.output == "Right" ||
+               k.output == "Up"   || k.output == "Down"  ||
+               k.output == "Home" || k.output == "End") {
         if (key_cb_) key_cb_(k.output);
     } else if (k.output == " ") {
         if (text_cb_) text_cb_(" ");

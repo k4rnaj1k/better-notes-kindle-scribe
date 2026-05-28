@@ -35,6 +35,7 @@ struct ToolState {
     double eraser_radius    = 30.0;
     bool   ocr_enabled      = false;
     bool   keyboard_visible = false;
+    bool   markdown_pretty  = false;   // markdown screen: pretty vs source view
 };
 
 const char *tool_label(Tool t);

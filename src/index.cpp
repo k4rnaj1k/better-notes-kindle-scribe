@@ -86,12 +86,20 @@ bool NotesIndex::open(const std::string &root, const std::string &subdir) {
             if (is_native_note_dir(full)) {
                 // Treat as a single note (the legacy betternotes format).
                 std::string title = name;
+                std::vector<std::string> tags;
                 std::string raw; json::Value v;
-                if (read_file(full + "/note.json", raw) && json::parse(raw, v))
+                if (read_file(full + "/note.json", raw) && json::parse(raw, v)) {
                     title = v.str("title", name);
-                entries_.push_back({rel, title, full,
-                                    mtime_ms(full + "/note.json"),
-                                    false, false});
+                    auto *ta = v.get("tags");
+                    if (ta && ta->type == json::Type::Array)
+                        for (auto &t : ta->arr)
+                            if (t.type == json::Type::String && !t.s.empty())
+                                tags.push_back(t.s);
+                }
+                IndexEntry e{rel, title, full,
+                             mtime_ms(full + "/note.json"), false, false};
+                e.tags = std::move(tags);
+                entries_.push_back(std::move(e));
             } else {
                 // Browseable folder (Obsidian-style or arbitrary subfolder).
                 entries_.push_back({rel, name, full,

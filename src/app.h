@@ -5,6 +5,7 @@
 #include "keyboard.h"
 #include "lasso.h"
 #include "links.h"
+#include "markdown.h"
 #include "ocr.h"
 #include "pen.h"
 #include "strokes.h"
@@ -50,8 +51,10 @@ public:
 
     void draw_link_picker(cairo_t *cr, int win_w, int win_h);
     void draw_export_overlay(cairo_t *cr, int win_w, int win_h);  // PDF progress
-    void draw_input_modal(cairo_t *cr, int win_w, int win_h);     // rename input
+    void draw_input_modal(cairo_t *cr, int win_w, int win_h);     // rename/tags input
     void draw_confirm_modal(cairo_t *cr, int win_w, int win_h);   // delete confirm
+    void draw_draw_modal(cairo_t *cr, int win_w, int win_h);      // draw/OCR canvas
+    void draw_template_picker(cairo_t *cr, int win_w, int win_h); // template chooser
     void draw_show_tab(cairo_t *cr, int win_w);   // "show toolbar" tab when hidden
     Rect show_tab_rect() const;                    // hit region for that tab
 
@@ -75,6 +78,10 @@ private:
     void markdown_undo();
     void markdown_insert(const std::string &text);
     void markdown_backspace();
+    void redraw_markdown_body();          // partial repaint of just the text band
+    void clamp_markdown_scroll();
+    void markdown_set_cursor_from_tap(double x, double y);
+    void markdown_move_cursor_vertical(int dir);   // -1 = up, +1 = down
 
     // --- screen routing ---
     void enter_browser();
@@ -88,12 +95,40 @@ private:
     void export_current_pdf();
     Rect export_overlay_rect() const;   // centred progress card
 
-    // Browser rename input modal.
+    // Browser rename / tags input modal. The on-screen keyboard edits
+    // input_buf_; commit_input() dispatches on input_purpose_.
+    enum class InputPurpose { Rename, Tags };
     void open_rename(const std::string &id, const std::string &cur_title);
-    void commit_input();   // apply the rename, close the modal
+    void commit_input();   // apply the rename/tags, close the modal
     void close_input();    // dismiss without applying
     Rect modal_card_rect() const;       // shared centred card geometry
     Rect modal_btn_rect(bool primary) const;  // Save/Delete (primary) | Cancel
+
+    // --- tags (#8): edit per-page or notebook tags via the input modal ---
+    enum class TagScope { Page, Notebook };
+    void open_tags_editor();
+    void commit_tags();                 // parse input_buf_ into the active scope
+    void load_tags_into_input();        // refill input_buf_ from the active scope
+    Rect tags_scope_btn_rect() const;   // Page↔Notebook toggle inside the modal
+    static std::vector<std::string> parse_tags(const std::string &csv);
+    static std::string join_tags(const std::vector<std::string> &tags);
+
+    // --- draw modal (#11 drawings / #9 OCR), markdown only ---
+    enum class DrawPurpose { Image, Ocr };
+    void open_draw_modal(DrawPurpose purpose);
+    void close_draw_modal();
+    void commit_draw_modal();
+    void handle_draw_sample(const PenSample &s);
+    Rect draw_canvas_rect() const;
+    Rect draw_btn_rect(int which) const;   // 0=Save 1=Clear 2=Cancel
+    // Rasterise draw_strokes_ (cropped to their bbox + padding) to a PNG.
+    // Returns false if there's nothing drawn or the write fails.
+    bool draw_render_png(const std::string &abs_path);
+
+    // --- template picker (#10) ---
+    void open_template_picker();
+    void apply_template(TemplateId tmpl, const std::string &bg_image);
+    void handle_template_picker_press(double x, double y);
 
     // --- pen sample → page coordinates ---
     void map_pen_to_page(const PenSample &s, double &px, double &py);
@@ -142,6 +177,13 @@ private:
     size_t        markdown_cursor_ = 0;             // byte offset into buf
     std::vector<std::pair<std::string, size_t>>
                   markdown_history_;                // (buf, cursor) snapshots for undo
+    // Markdown scroll/layout: scroll offset in px, last full content height,
+    // and the per-line layout map produced by the last render (used to map
+    // taps → cursor offset and to draw the caret).
+    double        markdown_scroll_     = 0.0;
+    double        markdown_content_h_  = 0.0;
+    double        md_scroll_at_press_  = 0.0;
+    std::vector<MdLineBox> md_lines_;
 
     // Pen capture state
     Stroke        live_stroke_;
@@ -168,6 +210,12 @@ private:
     bool          swipe_active_   = false;
     double        swipe_x0_       = 0;
     double        swipe_y0_       = 0;
+    // Last time a stylus sample was processed. Page swipes are finger-only, so
+    // a recent pen sample suppresses the swipe (the pen also emits pointer
+    // events). 400 ms covers the gap between an evdev sample and the GTK
+    // release without leaking into a genuine later finger swipe.
+    uint32_t      last_pen_ms_    = 0;
+    static constexpr uint32_t kPenSwipeGuardMs = 400;
 
     // Browser modals: rename (text input via the on-screen keyboard) and a
     // delete confirmation. Only one is open at a time.
@@ -178,6 +226,26 @@ private:
     bool          confirm_open_   = false;
     std::string   confirm_text_;       // e.g. "Delete \"Notes\"?"
     std::string   confirm_target_id_;
+    InputPurpose  input_purpose_  = InputPurpose::Rename;
+
+    // Tags editor state (shares the input modal/keyboard).
+    TagScope      tags_scope_     = TagScope::Page;
+
+    // Draw-to-attachment / OCR modal.
+    bool          draw_open_      = false;
+    DrawPurpose   draw_purpose_   = DrawPurpose::Image;
+    std::vector<Stroke> draw_strokes_;
+    Stroke        draw_live_;
+    bool          draw_pen_down_  = false;
+    bool          draw_erase_active_ = false;
+    double        draw_erase_px_  = 0;
+    double        draw_erase_py_  = 0;
+    InkRect       draw_ink_bbox_  = {0, 0, 0, 0};
+
+    // Template picker modal.
+    bool          tmpl_open_      = false;
+    int           tmpl_scroll_    = 0;
+    std::vector<std::string> tmpl_custom_;   // PNG filenames in vault templates/
 
     // Thread plumbing
     PenReader     pen_;

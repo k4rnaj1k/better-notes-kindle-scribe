@@ -5,6 +5,7 @@ namespace bn {
 void pages_append(Note &n, TemplateId tmpl) {
     n.pages.emplace_back();
     n.pages.back().tmpl = tmpl;
+    n.pages.back().bg_image = n.default_bg_image;
     n.mark_dirty();
 }
 

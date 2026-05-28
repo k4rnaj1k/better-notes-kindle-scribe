@@ -72,13 +72,30 @@ Stroke stroke_from_json(const json::Value &v) {
     return s;
 }
 
+json::Value tags_to_json(const std::vector<std::string> &tags) {
+    json::Value a = json::Value::make_arr();
+    a.arr.reserve(tags.size());
+    for (auto &t : tags) a.arr.push_back(json::Value::make_str(t));
+    return a;
+}
+
+void tags_from_json(const json::Value &v, std::vector<std::string> &out) {
+    auto *a = v.get("tags");
+    if (!a || a->type != json::Type::Array) return;
+    for (auto &tv : a->arr)
+        if (tv.type == json::Type::String && !tv.s.empty()) out.push_back(tv.s);
+}
+
 bool save_page(const std::string &path, const Page &p) {
     json::Value o = json::Value::make_obj();
     o.obj.emplace("template", json::Value::make_str(template_name(p.tmpl)));
+    if (!p.bg_image.empty())
+        o.obj.emplace("bg_image", json::Value::make_str(p.bg_image));
     json::Value arr = json::Value::make_arr();
     arr.arr.reserve(p.strokes.size());
     for (auto &s : p.strokes) arr.arr.push_back(stroke_to_json(s));
     o.obj.emplace("strokes", std::move(arr));
+    if (!p.tags.empty()) o.obj.emplace("tags", tags_to_json(p.tags));
     return write_file(path, json::serialize(o));
 }
 
@@ -88,11 +105,13 @@ bool load_page(const std::string &path, Page &p) {
     json::Value v;
     if (!json::parse(raw, v)) return false;
     p.tmpl = template_from_name(v.str("template", "blank"));
+    p.bg_image = v.str("bg_image", "");
     auto *arr = v.get("strokes");
     if (arr && arr->type == json::Type::Array) {
         p.strokes.reserve(arr->arr.size());
         for (auto &sv : arr->arr) p.strokes.push_back(stroke_from_json(sv));
     }
+    tags_from_json(v, p.tags);
     return true;
 }
 
@@ -106,6 +125,9 @@ bool save_note(const std::string &dir, const Note &n) {
     root.obj.emplace("title", json::Value::make_str(n.title));
     root.obj.emplace("template",
                      json::Value::make_str(template_name(n.default_template)));
+    if (!n.default_bg_image.empty())
+        root.obj.emplace("bg_image", json::Value::make_str(n.default_bg_image));
+    if (!n.tags.empty()) root.obj.emplace("tags", tags_to_json(n.tags));
 
     json::Value pages = json::Value::make_arr();
     for (size_t i = 0; i < n.pages.size(); ++i)
@@ -150,6 +172,8 @@ bool load_note(const std::string &dir, Note &out) {
     out.id    = root.str("id");
     out.title = root.str("title");
     out.default_template = template_from_name(root.str("template", "blank"));
+    out.default_bg_image = root.str("bg_image", "");
+    tags_from_json(root, out.tags);
 
     out.pages.clear();
     auto *pages = root.get("pages");
@@ -163,6 +187,7 @@ bool load_note(const std::string &dir, Note &out) {
     if (out.pages.empty()) {
         out.pages.emplace_back();
         out.pages.back().tmpl = out.default_template;
+        out.pages.back().bg_image = out.default_bg_image;
     }
 
     out.links.clear();

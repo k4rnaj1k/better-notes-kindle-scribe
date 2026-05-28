@@ -175,4 +175,54 @@ void Ocr::run_once(const Note &n, int page, int w_px, int h_px) {
 #endif
 }
 
+std::string Ocr::recognize(const std::vector<Stroke> &strokes,
+                           int w_px, int h_px) {
+#if BN_HAVE_TESSERACT
+    if (strokes.empty() || w_px <= 0 || h_px <= 0) return "";
+
+    cairo_surface_t *surf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w_px, h_px);
+    cairo_t *cr = cairo_create(surf);
+    cairo_set_source_rgb(cr, 1, 1, 1);   // white page for good contrast
+    cairo_paint(cr);
+    for (auto &s : strokes) canvas_render_stroke(cr, s);
+    cairo_destroy(cr);
+    cairo_surface_flush(surf);
+
+    // A dedicated instance kept alive across calls (init is slow). Separate
+    // from the background worker's so the two never race.
+    static tesseract::TessBaseAPI *tess = nullptr;
+    if (!tess) {
+        tess = new tesseract::TessBaseAPI();
+        if (tess->Init(tessdata_.empty() ? nullptr : tessdata_.c_str(),
+                       "eng") != 0) {
+            log_err("ocr: recognize() tesseract init failed (tessdata=%s)",
+                    tessdata_.c_str());
+            delete tess; tess = nullptr;
+            cairo_surface_destroy(surf);
+            return "";
+        }
+    }
+    // Treat the box as a single text line (handles one word or a short phrase).
+    tess->SetPageSegMode(tesseract::PSM_SINGLE_LINE);
+
+    unsigned char *data = cairo_image_surface_get_data(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+    tess->SetImage(data, w_px, h_px, 4, stride);
+    char *text = tess->GetUTF8Text();
+    std::string out = text ? text : "";
+    delete[] text;
+    cairo_surface_destroy(surf);
+
+    // Trim surrounding whitespace/newlines Tesseract appends.
+    size_t a = out.find_first_not_of(" \t\r\n");
+    size_t b = out.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    return out.substr(a, b - a + 1);
+#else
+    (void)strokes; (void)w_px; (void)h_px;
+    return "";
+#endif
+}
+
 } // namespace bn

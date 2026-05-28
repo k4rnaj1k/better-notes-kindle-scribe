@@ -29,15 +29,24 @@ struct Link {
 
 struct Page {
     TemplateId           tmpl = TemplateId::Blank;
+    // Custom PNG template: a path (vault-relative, e.g. "templates/foo.png")
+    // painted as the page background. When non-empty it overrides `tmpl`.
+    std::string          bg_image;
     std::vector<Stroke>  strokes;
+    // Per-page tags.
+    std::vector<std::string> tags;
 };
 
 struct Note {
     std::string         id;
     std::string         title;
     TemplateId          default_template = TemplateId::Blank;
+    // Custom PNG template inherited by new pages (vault-relative path).
+    std::string         default_bg_image;
     std::vector<Page>   pages;
     std::vector<Link>   links;
+    // Notebook-level tags.
+    std::vector<std::string> tags;
     bool                dirty = false;
 
     // OCR results per page index → recognised text.

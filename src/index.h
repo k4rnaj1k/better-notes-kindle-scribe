@@ -13,6 +13,8 @@ struct IndexEntry {
     uint32_t    updated_ms = 0;
     bool        is_markdown = false;  // plain .md file (Obsidian-style)
     bool        is_folder   = false;  // child directory at the current level
+    // Notebook-level tags (native notes only), read from note.json for display.
+    std::vector<std::string> tags;
 };
 
 // Treats the notes_dir as a vault root. open(root, subdir="") shows the

@@ -45,6 +45,13 @@ public:
     // and height are the on-screen page dimensions in pixels.
     void notify(const Note &n, int page, int w_px, int h_px);
 
+    // Synchronously OCR a set of strokes rendered onto a w_px×h_px white
+    // canvas, returning the recognised text (trimmed). Runs on the caller's
+    // thread (used by the markdown draw-box). Returns "" when Tesseract is
+    // unavailable or nothing was recognised.
+    std::string recognize(const std::vector<Stroke> &strokes,
+                           int w_px, int h_px);
+
     void stop();
 
 private:

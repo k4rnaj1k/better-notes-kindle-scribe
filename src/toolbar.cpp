@@ -195,6 +195,73 @@ void draw_icon(cairo_t *cr, ToolbarAction action,
         cairo_stroke(cr);
         break;
     }
+    case ToolbarAction::MdView: {
+        // Eye = preview/view toggle.
+        cairo_move_to(cr, cx - s, cy);
+        cairo_curve_to(cr, cx - s * 0.4, cy - s * 0.9,
+                           cx + s * 0.4, cy - s * 0.9, cx + s, cy);
+        cairo_curve_to(cr, cx + s * 0.4, cy + s * 0.9,
+                           cx - s * 0.4, cy + s * 0.9, cx - s, cy);
+        cairo_close_path(cr);
+        cairo_stroke(cr);
+        cairo_arc(cr, cx, cy, s * 0.32, 0, 2 * M_PI);
+        cairo_fill(cr);
+        break;
+    }
+    case ToolbarAction::InsertDrawing: {
+        // Framed picture with a "mountain" + sun = insert image.
+        cairo_rectangle(cr, cx - s, cy - s * 0.8, 2 * s, s * 1.6);
+        cairo_stroke(cr);
+        cairo_arc(cr, cx + s * 0.4, cy - s * 0.3, s * 0.18, 0, 2 * M_PI);
+        cairo_fill(cr);
+        cairo_move_to(cr, cx - s, cy + s * 0.8);
+        cairo_line_to(cr, cx - s * 0.2, cy);
+        cairo_line_to(cr, cx + s * 0.3, cy + s * 0.4);
+        cairo_line_to(cr, cx + s, cy - s * 0.1);
+        cairo_stroke(cr);
+        break;
+    }
+    case ToolbarAction::Tags: {
+        // Tag/label with a hole.
+        cairo_move_to(cr, cx - s * 0.2, cy - s);
+        cairo_line_to(cr, cx + s, cy - s);
+        cairo_line_to(cr, cx + s, cy + s * 0.2);
+        cairo_line_to(cr, cx - s * 0.2, cy + s);
+        cairo_line_to(cr, cx - s, cy - s * 0.4);
+        cairo_close_path(cr);
+        cairo_stroke(cr);
+        cairo_arc(cr, cx + s * 0.45, cy - s * 0.4, lw * 0.6, 0, 2 * M_PI);
+        cairo_fill(cr);
+        break;
+    }
+    case ToolbarAction::OcrWord: {
+        // Pen tip over a baseline + "A" = handwriting → text.
+        cairo_move_to(cr, cx - s, cy - s * 0.2);
+        cairo_line_to(cr, cx + s * 0.3, cy - s);
+        cairo_stroke(cr);
+        cairo_move_to(cr, cx - s, cy + s);
+        cairo_line_to(cr, cx + s, cy + s);   // baseline
+        cairo_stroke(cr);
+        cairo_set_line_width(cr, lw * 0.7);
+        cairo_move_to(cr, cx + s * 0.1, cy + s * 0.5);
+        cairo_line_to(cr, cx + s * 0.45, cy - s * 0.4);
+        cairo_line_to(cr, cx + s * 0.8, cy + s * 0.5);
+        cairo_stroke(cr);
+        break;
+    }
+    case ToolbarAction::Template: {
+        // Page with ruled lines = template chooser.
+        cairo_rectangle(cr, cx - s * 0.8, cy - s, s * 1.6, 2 * s);
+        cairo_stroke(cr);
+        cairo_set_line_width(cr, lw * 0.7);
+        for (int i = -1; i <= 1; ++i) {
+            double yy = cy + i * (s * 0.55);
+            cairo_move_to(cr, cx - s * 0.5, yy);
+            cairo_line_to(cr, cx + s * 0.5, yy);
+        }
+        cairo_stroke(cr);
+        break;
+    }
     default:
         break;
     }
@@ -223,7 +290,7 @@ void draw_button(cairo_t *cr, const ToolbarButton &b, bool active) {
 
 } // namespace
 
-void Toolbar::layout(double width) {
+void Toolbar::layout(double width, ToolbarMode mode) {
     width_  = width;
     // Tall toolbar for finger-friendly tap targets. Button *width* is
     // computed to fit every button in one row, so it scales with screen
@@ -234,31 +301,46 @@ void Toolbar::layout(double width) {
     const double status_h = 22.0;
     buttons_.clear();
 
-    struct Def { ToolbarAction action; };
-    static const Def defs[] = {
-        {ToolbarAction::Pen},
-        {ToolbarAction::Eraser},
-        {ToolbarAction::Lasso},
-        {ToolbarAction::Keyboard},
-        {ToolbarAction::OcrToggle},
-        {ToolbarAction::Undo},
-        {ToolbarAction::Save},
-        {ToolbarAction::ExportPdf},
-        {ToolbarAction::AddPage},
-        {ToolbarAction::PrevPage},
-        {ToolbarAction::NextPage},
-        {ToolbarAction::Back},
-        {ToolbarAction::Browser},
-        {ToolbarAction::Exit},
-        {ToolbarAction::Hide},
+    static const ToolbarAction note_defs[] = {
+        ToolbarAction::Pen,
+        ToolbarAction::Eraser,
+        ToolbarAction::Lasso,
+        ToolbarAction::Template,
+        ToolbarAction::Tags,
+        ToolbarAction::Save,
+        ToolbarAction::ExportPdf,
+        ToolbarAction::AddPage,
+        ToolbarAction::PrevPage,
+        ToolbarAction::NextPage,
+        ToolbarAction::Back,
+        ToolbarAction::Browser,
+        ToolbarAction::Exit,
+        ToolbarAction::Hide,
     };
-    const int n = (int)(sizeof(defs) / sizeof(defs[0]));
+    static const ToolbarAction md_defs[] = {
+        ToolbarAction::MdView,
+        ToolbarAction::InsertDrawing,
+        ToolbarAction::OcrWord,
+        ToolbarAction::Keyboard,
+        ToolbarAction::Tags,
+        ToolbarAction::Undo,
+        ToolbarAction::Save,
+        ToolbarAction::Back,
+        ToolbarAction::Browser,
+        ToolbarAction::Exit,
+        ToolbarAction::Hide,
+    };
+    const ToolbarAction *defs = (mode == ToolbarMode::Markdown)
+                                    ? md_defs : note_defs;
+    const int n = (mode == ToolbarMode::Markdown)
+                      ? (int)(sizeof(md_defs) / sizeof(md_defs[0]))
+                      : (int)(sizeof(note_defs) / sizeof(note_defs[0]));
     double bh = height_ - m - status_h;
     double bw = (width_ - 2 * m - (n - 1) * gap) / n;
     for (int i = 0; i < n; ++i) {
         ToolbarButton b{};
         b.label  = "";
-        b.action = defs[i].action;
+        b.action = defs[i];
         b.rect.x = m + i * (bw + gap);
         b.rect.y = m;
         b.rect.w = bw;
@@ -306,6 +388,7 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
             case ToolbarAction::Lasso:     active = st.current == Tool::Lasso; break;
             case ToolbarAction::Keyboard:  active = st.keyboard_visible; break;
             case ToolbarAction::OcrToggle: active = st.ocr_enabled; break;
+            case ToolbarAction::MdView:    active = st.markdown_pretty; break;
             default: break;
         }
         draw_button(cr, b, active);

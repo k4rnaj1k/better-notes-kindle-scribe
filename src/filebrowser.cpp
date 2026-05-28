@@ -101,6 +101,17 @@ void FileBrowser::draw(cairo_t *cr, const NotesIndex &idx,
         draw_text(cr, 70, y + 14, entries[i].title.c_str(),
                   "Sans 22", 0.1, 0.1, 0.1);
 
+        // Notebook tags as a subdued "#tag" line beneath the title.
+        if (!entries[i].tags.empty()) {
+            std::string line;
+            for (auto &t : entries[i].tags) {
+                if (!line.empty()) line += "  ";
+                line += "#" + t;
+            }
+            draw_text(cr, 70, y + 48, line.c_str(), "Sans 15",
+                      0.45, 0.45, 0.45);
+        }
+
         // Per-row Rename / Delete buttons (notes + markdown only).
         if (!entries[i].is_folder) {
             Rect rn, dl;

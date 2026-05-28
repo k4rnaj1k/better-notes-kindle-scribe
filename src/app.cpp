@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -162,6 +163,7 @@ int App::run(int argc, char *argv[]) {
     }
 
     index_.open(notes_dir_);
+    canvas_set_vault_root(notes_dir_);   // resolves custom-template bg_image paths
     ocr_.set_tessdata_dir(tessdata_dir_);
     ocr_.set_callback([this](const OcrResult &r){
         std::lock_guard<std::mutex> g(q_mu_);
@@ -195,7 +197,7 @@ int App::run(int argc, char *argv[]) {
         if (input_open_) { input_buf_ += t; redraw(); return; }
         if (screen_ == Screen::Markdown) {
             markdown_insert(t);
-            redraw();
+            redraw_markdown_body();
         }
     });
     keyboard_.on_key([this](const std::string &k){
@@ -230,8 +232,10 @@ int App::run(int argc, char *argv[]) {
             size_t nl = markdown_buf_.find('\n', markdown_cursor_);
             markdown_cursor_ = (nl == std::string::npos)
                 ? markdown_buf_.size() : nl;
+        } else if (k == "Up" || k == "Down") {
+            markdown_move_cursor_vertical(k == "Up" ? -1 : 1);
         }
-        redraw();
+        redraw_markdown_body();
     });
 
     // Was a 16 ms polling timer. The pen thread now wakes the main loop
@@ -281,6 +285,11 @@ void App::process_async_events() {
 
     while (!pq.empty()) {
         const PenSample s = pq.front(); pq.pop();
+        // The draw/OCR modal captures stylus input into its own canvas, on top
+        // of (and instead of) the markdown screen below it.
+        if (draw_open_) { last_pen_ms_ = now_ms(); handle_draw_sample(s); continue; }
+        // A blocking modal owns input; don't let the stylus draw behind it.
+        if (input_open_ || tmpl_open_) continue;
         if (screen_ != Screen::NoteView) continue;
         // The dropdown is opened by finger (GTK) taps; a stylus touch on the
         // canvas dismisses it so drawing isn't blocked by a stale overlay.
@@ -289,18 +298,22 @@ void App::process_async_events() {
             toolbar_.close_pen_menu();
             redraw_rect(0, 0, (double)win_w_, extent);
         }
-        if (s.tool == PenButton::Rubber && tool_.current != Tool::Eraser) {
-            tool_.current = Tool::Eraser;
-            redraw_toolbar();   // only the active-tool indicator changes
-        } else if (s.tool == PenButton::Pen && tool_.current == Tool::Eraser) {
-            tool_.current = Tool::Pen;
-            redraw_toolbar();
-        }
+        // The pen's eraser end is a property of the physical stylus, not the
+        // toolbar. Treat a Rubber sample as the eraser tool for THIS sample
+        // only — no tool_.current mutation, no redraw_toolbar(). That removes
+        // the old "darken the toolbar button, then start erasing" delay so the
+        // eraser bites the instant the rubber touches.
+        Tool eff = (s.tool == PenButton::Rubber) ? Tool::Eraser : tool_.current;
+
+        // Note when the stylus was last seen so finger-only gestures (page
+        // swipes) can ignore pointer events the pen also emits. See
+        // on_button_release.
+        last_pen_ms_ = now_ms();
 
         double px, py;
         map_pen_to_page(s, px, py);
 
-        if (tool_.current == Tool::Pen) {
+        if (eff == Tool::Pen) {
             if (s.down && !pen_down_) {
                 pen_down_ = true;
                 const PenPreset &pp = kPenPresets[tool_.pen_preset];
@@ -375,9 +388,9 @@ void App::process_async_events() {
                         std::move(live_stroke_));
                     live_stroke_ = Stroke{};
                     note_.mark_dirty();
-                    if (tool_.ocr_enabled) {
-                        ocr_.notify(note_, current_page_, win_w_, win_h_);
-                    }
+                    // OCR is no longer a notebook feature — it now lives in the
+                    // markdown draw-box (see open_draw_modal/DrawPurpose::Ocr),
+                    // so notebooks never trigger background recognition.
                     if (inkfb_available() && live_ink_bbox_.w > 0) {
                         // inkfb already painted this stroke into the
                         // framebuffer; a GC16 settle just snaps the A2 ghost to
@@ -400,7 +413,7 @@ void App::process_async_events() {
                     live_ink_bbox_ = {0, 0, 0, 0};
                 }
             }
-        } else if (tool_.current == Tool::Eraser) {
+        } else if (eff == Tool::Eraser) {
             if (s.down && current_page_ < (int)note_.pages.size()) {
                 // Sweep from the previous sample to this one so a fast drag
                 // erases the whole path, not isolated dots.
@@ -420,7 +433,7 @@ void App::process_async_events() {
             } else if (!s.down) {
                 erase_active_ = false;
             }
-        } else if (tool_.current == Tool::Lasso) {
+        } else if (eff == Tool::Lasso) {
             if (s.down) {
                 if (!pen_down_) { pen_down_ = true; lasso_.clear(); }
                 Point p; p.x = px; p.y = py;
@@ -548,6 +561,8 @@ void App::enter_markdown(const std::string &path) {
     markdown_cursor_ = markdown_buf_.size();
     markdown_history_.clear();
     markdown_dirty_ = false;
+    markdown_scroll_ = 0.0;
+    md_lines_.clear();
     screen_ = Screen::Markdown;
     redraw();
 }
@@ -589,6 +604,66 @@ void App::markdown_backspace() {
     markdown_buf_.erase(markdown_cursor_ - n, n);
     markdown_cursor_ -= n;
     markdown_dirty_ = true;
+}
+
+void App::redraw_markdown_body() {
+    // Repaint only the text band (below the toolbar, above the keyboard). A
+    // full redraw() here fired a slow whole-screen e-ink refresh on every
+    // keystroke, which is what made typing feel laggy.
+    double top    = toolbar_.height();
+    double bottom = keyboard_.visible() ? keyboard_.top_y() : (double)win_h_;
+    redraw_rect(0, top, (double)win_w_, bottom - top);
+}
+
+void App::clamp_markdown_scroll() {
+    double top    = toolbar_.height() + 12;
+    double bottom = keyboard_.visible() ? keyboard_.top_y() : (double)win_h_;
+    double view   = bottom - top;
+    double maxs   = std::max(0.0, markdown_content_h_ - view);
+    if (markdown_scroll_ < 0.0)   markdown_scroll_ = 0.0;
+    if (markdown_scroll_ > maxs)  markdown_scroll_ = maxs;
+}
+
+void App::markdown_set_cursor_from_tap(double x, double y) {
+    if (md_lines_.empty()) return;
+    // markdown_offset_at needs a cairo context to lay out text for hit-testing;
+    // font metrics are target-independent, so a throwaway 1x1 surface suffices.
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_A8, 1, 1);
+    cairo_t *cr = cairo_create(s);
+    markdown_cursor_ = markdown_offset_at(cr, markdown_buf_, md_lines_, x, y);
+    cairo_destroy(cr);
+    cairo_surface_destroy(s);
+}
+
+void App::markdown_move_cursor_vertical(int dir) {
+    if (md_lines_.empty()) return;
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_A8, 1, 1);
+    cairo_t *cr = cairo_create(s);
+
+    double cx, cy0, cy1;
+    if (!markdown_caret(cr, markdown_buf_, md_lines_, markdown_cursor_,
+                        &cx, &cy0, &cy1)) {
+        cairo_destroy(cr); cairo_surface_destroy(s);
+        return;
+    }
+    // Index of the line the cursor is currently on.
+    int cur = 0;
+    for (int i = 0; i < (int)md_lines_.size(); ++i) {
+        const MdLineBox &b = md_lines_[i];
+        if (markdown_cursor_ >= b.off && markdown_cursor_ <= b.off + b.len) {
+            cur = i; break;
+        }
+        if (markdown_cursor_ > b.off + b.len) cur = i;
+    }
+    int tgt = cur + dir;
+    if (tgt >= 0 && tgt < (int)md_lines_.size()) {
+        const MdLineBox &b = md_lines_[tgt];
+        double midy = (b.y0 + b.y1) / 2.0;   // keep column x, snap to target row
+        markdown_cursor_ =
+            markdown_offset_at(cr, markdown_buf_, md_lines_, cx, midy);
+    }
+    cairo_destroy(cr);
+    cairo_surface_destroy(s);
 }
 
 void App::save_current() {
@@ -714,6 +789,7 @@ Rect App::modal_btn_rect(bool primary) const {
 
 void App::open_rename(const std::string &id, const std::string &cur_title) {
     input_open_      = true;
+    input_purpose_   = InputPurpose::Rename;
     input_title_     = "Rename";
     input_buf_       = cur_title;
     input_target_id_ = id;
@@ -722,6 +798,11 @@ void App::open_rename(const std::string &id, const std::string &cur_title) {
 }
 
 void App::commit_input() {
+    if (input_purpose_ == InputPurpose::Tags) {
+        commit_tags();
+        close_input();   // hides keyboard + redraws (stays on the note)
+        return;
+    }
     std::string id = input_target_id_, name = input_buf_;
     close_input();
     if (!id.empty() && !name.empty()) index_.rename_entry(id, name);
@@ -779,6 +860,22 @@ void App::draw_input_modal(cairo_t *cr, int win_w, int win_h) {
     g_object_unref(t);
     pango_font_description_free(fd);
 
+    // Tags modal: a Page↔Notebook scope toggle and a comma-separated hint.
+    if (input_purpose_ == InputPurpose::Tags) {
+        modal_button(cr, tags_scope_btn_rect(),
+                     tags_scope_ == TagScope::Notebook ? "Notebook" : "Page",
+                     false);
+        PangoLayout *hint = pango_cairo_create_layout(cr);
+        PangoFontDescription *hfd = pango_font_description_from_string("Sans 13");
+        pango_layout_set_font_description(hint, hfd);
+        pango_font_description_free(hfd);
+        pango_layout_set_text(hint, "comma-separated", -1);
+        cairo_set_source_rgb(cr, 0.5, 0.5, 0.5);
+        cairo_move_to(cr, c.x + 26, c.y + 138);
+        pango_cairo_show_layout(cr, hint);
+        g_object_unref(hint);
+    }
+
     // Editable text field with a trailing cursor bar.
     Rect f{c.x + 24, c.y + 74, c.w - 48, 56};
     cairo_set_source_rgb(cr, 1, 1, 1);
@@ -831,6 +928,498 @@ void App::draw_confirm_modal(cairo_t *cr, int win_w, int win_h) {
     modal_button(cr, modal_btn_rect(false), "Cancel", false);
 }
 
+// ----------------------------------------------------------------------------
+// Tags (#8): per-page + notebook tags, edited through the input modal.
+// ----------------------------------------------------------------------------
+
+std::vector<std::string> App::parse_tags(const std::string &csv) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i <= csv.size()) {
+        size_t j = csv.find(',', i);
+        if (j == std::string::npos) j = csv.size();
+        std::string t = csv.substr(i, j - i);
+        size_t a = t.find_first_not_of(" \t\r\n#");
+        size_t b = t.find_last_not_of(" \t\r\n");
+        if (a != std::string::npos && b != std::string::npos && b >= a)
+            out.push_back(t.substr(a, b - a + 1));
+        if (j == csv.size()) break;
+        i = j + 1;
+    }
+    return out;
+}
+
+std::string App::join_tags(const std::vector<std::string> &tags) {
+    std::string out;
+    for (size_t i = 0; i < tags.size(); ++i) {
+        if (i) out += ", ";
+        out += tags[i];
+    }
+    return out;
+}
+
+void App::load_tags_into_input() {
+    const std::vector<std::string> *src = &note_.tags;
+    if (tags_scope_ == TagScope::Page &&
+        current_page_ >= 0 && current_page_ < (int)note_.pages.size())
+        src = &note_.pages[current_page_].tags;
+    input_buf_   = join_tags(*src);
+    input_title_ = (tags_scope_ == TagScope::Notebook)
+                       ? "Tags — notebook" : "Tags — page";
+}
+
+void App::open_tags_editor() {
+    // Tags live on native notes (notebooks + their pages); markdown files are
+    // plain .md where tags are just #hashtags in the body.
+    if (screen_ != Screen::NoteView) {
+        status_ = "tags: open a notebook";
+        redraw_toolbar();
+        return;
+    }
+    input_open_    = true;
+    input_purpose_ = InputPurpose::Tags;
+    tags_scope_    = TagScope::Page;
+    load_tags_into_input();
+    keyboard_.set_visible(true);
+    redraw();
+}
+
+void App::commit_tags() {
+    std::vector<std::string> parsed = parse_tags(input_buf_);
+    if (tags_scope_ == TagScope::Notebook) {
+        note_.tags = std::move(parsed);
+    } else if (current_page_ >= 0 && current_page_ < (int)note_.pages.size()) {
+        note_.pages[current_page_].tags = std::move(parsed);
+    }
+    note_.mark_dirty();
+}
+
+Rect App::tags_scope_btn_rect() const {
+    Rect c = modal_card_rect();
+    double bw = 180, bh = 44;
+    return Rect{c.x + c.w - 24 - bw, c.y + 16, bw, bh};
+}
+
+// ----------------------------------------------------------------------------
+// Draw modal (#11 drawings / #9 OCR), markdown only.
+// ----------------------------------------------------------------------------
+
+Rect App::draw_canvas_rect() const {
+    const double bar = 76.0;   // top button bar
+    return Rect{0, bar, (double)win_w_, (double)win_h_ - bar};
+}
+
+Rect App::draw_btn_rect(int which) const {
+    const double bw = 150, bh = 56, gap = 10, m = 12, y = 10;
+    if (which == 2)   // Cancel hugs the right edge
+        return Rect{(double)win_w_ - m - bw, y, bw, bh};
+    return Rect{m + which * (bw + gap), y, bw, bh};  // 0=Save, 1=Clear
+}
+
+void App::open_draw_modal(DrawPurpose purpose) {
+    draw_open_         = true;
+    draw_purpose_      = purpose;
+    draw_strokes_.clear();
+    draw_live_         = Stroke{};
+    draw_pen_down_     = false;
+    draw_erase_active_ = false;
+    draw_ink_bbox_     = {0, 0, 0, 0};
+    status_ = (purpose == DrawPurpose::Ocr) ? "draw a word, then Save"
+                                            : "draw, then Save";
+    redraw();
+}
+
+void App::close_draw_modal() {
+    draw_open_         = false;
+    draw_pen_down_     = false;
+    draw_erase_active_ = false;
+    draw_strokes_.clear();
+    draw_live_         = Stroke{};
+    redraw();
+}
+
+void App::handle_draw_sample(const PenSample &s) {
+    double px, py; map_pen_to_page(s, px, py);
+    Rect canvas = draw_canvas_rect();
+    Tool eff = (s.tool == PenButton::Rubber) ? Tool::Eraser : Tool::Pen;
+
+    if (eff == Tool::Eraser) {
+        if (s.down) {
+            double ex0 = draw_erase_active_ ? draw_erase_px_ : px;
+            double ey0 = draw_erase_active_ ? draw_erase_py_ : py;
+            draw_erase_active_ = true; draw_erase_px_ = px; draw_erase_py_ = py;
+            Page tmp; tmp.strokes = std::move(draw_strokes_);
+            Rect d = canvas_erase_at(tmp, ex0, ey0, px, py, tool_.eraser_radius);
+            draw_strokes_ = std::move(tmp.strokes);
+            if (d.w > 0 || d.h > 0)
+                redraw_rect(canvas.x, canvas.y, canvas.w, canvas.h);
+        } else {
+            draw_erase_active_ = false;
+        }
+        return;
+    }
+
+    if (s.down) {
+        if (!draw_pen_down_) {
+            if (!canvas.contains(px, py)) return;   // ignore touches on the bar
+            draw_pen_down_ = true;
+            const PenPreset &pp = kPenPresets[tool_.pen_preset];
+            draw_live_ = Stroke{};
+            draw_live_.tool     = Tool::Pen;
+            draw_live_.pen_type = pp.type;
+            draw_live_.width    = pp.width;
+            draw_ink_bbox_      = {0, 0, 0, 0};
+        }
+        if (draw_pen_down_) {
+            Point p; p.x = px; p.y = py;
+            p.pressure = (float)s.pressure /
+                (float)std::max(1, pen_.calibration().max_pressure);
+            p.t_ms = s.t_ms;
+            if (!draw_live_.pts.empty()) {
+                const Point &prev = draw_live_.pts.back();
+                if (inkfb_available()) {
+                    InkRect r = inkfb_draw_segment(prev.x, prev.y, p.x, p.y,
+                                                   draw_live_.width);
+                    if (draw_ink_bbox_.w == 0) {
+                        draw_ink_bbox_ = r;
+                    } else {
+                        int ax = std::min(draw_ink_bbox_.x, r.x);
+                        int ay = std::min(draw_ink_bbox_.y, r.y);
+                        int bx = std::max(draw_ink_bbox_.x + draw_ink_bbox_.w,
+                                          r.x + r.w);
+                        int by = std::max(draw_ink_bbox_.y + draw_ink_bbox_.h,
+                                          r.y + r.h);
+                        draw_ink_bbox_ = {ax, ay, bx - ax, by - ay};
+                    }
+                } else {
+                    double mnx = std::min(prev.x, p.x) - draw_live_.width;
+                    double mny = std::min(prev.y, p.y) - draw_live_.width;
+                    double mxx = std::max(prev.x, p.x) + draw_live_.width;
+                    double mxy = std::max(prev.y, p.y) + draw_live_.width;
+                    redraw_rect(mnx, mny, mxx - mnx, mxy - mny);
+                }
+            }
+            draw_live_.pts.push_back(p);
+        }
+    } else if (draw_pen_down_) {
+        draw_pen_down_ = false;
+        if (!draw_live_.pts.empty()) {
+            draw_strokes_.push_back(std::move(draw_live_));
+            draw_live_ = Stroke{};
+        }
+        if (inkfb_available() && draw_ink_bbox_.w > 0)
+            inkfb_settle(draw_ink_bbox_);
+        else
+            redraw_rect(canvas.x, canvas.y, canvas.w, canvas.h);
+        draw_ink_bbox_ = {0, 0, 0, 0};
+    }
+}
+
+bool App::draw_render_png(const std::string &abs_path) {
+    if (draw_strokes_.empty()) return false;
+    double minx = 1e18, miny = 1e18, maxx = -1e18, maxy = -1e18;
+    for (auto &s : draw_strokes_) {
+        Rect b = s.bbox();
+        minx = std::min(minx, b.x);      miny = std::min(miny, b.y);
+        maxx = std::max(maxx, b.x + b.w); maxy = std::max(maxy, b.y + b.h);
+    }
+    const double pad = 16.0;
+    int w = (int)std::ceil(maxx - minx + 2 * pad);
+    int h = (int)std::ceil(maxy - miny + 2 * pad);
+    if (w < 1 || h < 1) return false;
+
+    cairo_surface_t *surf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    cairo_t *cr = cairo_create(surf);
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_paint(cr);
+    cairo_translate(cr, pad - minx, pad - miny);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    for (auto &s : draw_strokes_) canvas_render_stroke(cr, s);
+    cairo_destroy(cr);
+    cairo_status_t st = cairo_surface_write_to_png(surf, abs_path.c_str());
+    cairo_surface_destroy(surf);
+    return st == CAIRO_STATUS_SUCCESS;
+}
+
+void App::commit_draw_modal() {
+    if (draw_strokes_.empty()) { close_draw_modal(); return; }
+
+    if (draw_purpose_ == DrawPurpose::Ocr) {
+        Rect canvas = draw_canvas_rect();
+        std::string word =
+            ocr_.recognize(draw_strokes_, (int)canvas.w, (int)canvas.h);
+        if (!word.empty()) {
+            markdown_snapshot();
+            markdown_insert(word);
+            status_ = "ocr → " + word;
+        } else {
+            status_ = "ocr: nothing recognised";
+        }
+        close_draw_modal();
+        return;
+    }
+
+    // Image: rasterise to attachments/drawing-N.png next to the .md, then
+    // insert a standard image link at the cursor.
+    std::string md_dir = markdown_path_;
+    size_t slash = md_dir.find_last_of('/');
+    md_dir = (slash == std::string::npos) ? "." : md_dir.substr(0, slash);
+    std::string att = md_dir + "/attachments";
+    ensure_dir(att);
+
+    std::string fname;
+    for (int i = 1; i < 100000; ++i) {
+        char b[32]; std::snprintf(b, sizeof(b), "drawing-%d.png", i);
+        if (!path_exists(att + "/" + b)) { fname = b; break; }
+    }
+    if (!fname.empty() && draw_render_png(att + "/" + fname)) {
+        markdown_snapshot();
+        markdown_insert("![](attachments/" + fname + ")");
+        status_ = "inserted " + fname;
+    } else {
+        status_ = "drawing save failed";
+    }
+    close_draw_modal();
+}
+
+void App::draw_draw_modal(cairo_t *cr, int win_w, int win_h) {
+    Rect canvas = draw_canvas_rect();
+
+    // White drawing surface.
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_rectangle(cr, 0, 0, win_w, win_h);
+    cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.8, 0.8, 0.8);
+    cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, canvas.x + 1, canvas.y, canvas.w - 2, canvas.h - 1);
+    cairo_stroke(cr);
+
+    // Committed + live ink, hard-edged to match the inkfb fast path.
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    for (auto &s : draw_strokes_) canvas_render_stroke(cr, s);
+    if (draw_pen_down_) canvas_render_stroke(cr, draw_live_);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_DEFAULT);
+
+    // Top button bar.
+    cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
+    cairo_rectangle(cr, 0, 0, win_w, canvas.y);
+    cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, 0, canvas.y); cairo_line_to(cr, win_w, canvas.y);
+    cairo_stroke(cr);
+
+    modal_button(cr, draw_btn_rect(0), "Save",   true);
+    modal_button(cr, draw_btn_rect(1), "Clear",  false);
+    modal_button(cr, draw_btn_rect(2), "Cancel", false);
+
+    PangoLayout *t = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string("Sans 16");
+    pango_layout_set_font_description(t, fd);
+    pango_font_description_free(fd);
+    pango_layout_set_text(t, draw_purpose_ == DrawPurpose::Ocr
+                                 ? "Draw a word → OCR" : "Draw → attachment", -1);
+    cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
+    cairo_move_to(cr, draw_btn_rect(1).x + draw_btn_rect(1).w + 24, 26);
+    pango_cairo_show_layout(cr, t);
+    g_object_unref(t);
+}
+
+// ----------------------------------------------------------------------------
+// Template picker (#10): built-in templates + custom PNGs in vault templates/.
+// ----------------------------------------------------------------------------
+
+void App::open_template_picker() {
+    if (screen_ != Screen::NoteView) return;
+    tmpl_custom_.clear();
+    for (auto &f : list_dir(notes_dir_ + "/templates")) {
+        if (f.size() > 4) {
+            std::string ext = f.substr(f.size() - 4);
+            for (auto &c : ext) c = (char)std::tolower((unsigned char)c);
+            if (ext == ".png") tmpl_custom_.push_back(f);
+        }
+    }
+    std::sort(tmpl_custom_.begin(), tmpl_custom_.end());
+    tmpl_open_   = true;
+    tmpl_scroll_ = 0;
+    redraw();
+}
+
+void App::apply_template(TemplateId tmpl, const std::string &bg_image) {
+    if (current_page_ >= 0 && current_page_ < (int)note_.pages.size()) {
+        note_.pages[current_page_].tmpl     = tmpl;
+        note_.pages[current_page_].bg_image = bg_image;
+    }
+    // New pages inherit the most-recently chosen template.
+    note_.default_template = tmpl;
+    note_.default_bg_image = bg_image;
+    note_.mark_dirty();
+}
+
+void App::handle_template_picker_press(double x, double y) {
+    double cw = std::min(560.0, win_w_ * 0.85);
+    double ch = std::min(880.0, win_h_ * 0.80);
+    double cx = (win_w_ - cw) / 2.0;
+    double cy = (win_h_ - ch) / 2.0;
+
+    // Close (X) or tap-outside cancels.
+    double xs = 56;
+    Rect close_r{cx + cw - xs - 12, cy + 12, xs, xs};
+    if (close_r.contains(x, y) ||
+        x < cx || x > cx + cw || y < cy || y > cy + ch) {
+        tmpl_open_ = false;
+        redraw();
+        return;
+    }
+
+    int total = 4 + (int)tmpl_custom_.size();
+    double row_h = 64;
+    double list_top = cy + 80;
+    double list_bot = cy + ch - 16;
+    int rows_visible = std::max(0, (int)((list_bot - list_top) / row_h));
+
+    if (y >= list_top && y < list_top + 40 && tmpl_scroll_ > 0) {
+        tmpl_scroll_ = std::max(0, tmpl_scroll_ - rows_visible);
+        redraw(); return;
+    }
+    if (y >= list_bot - 40 && y <= list_bot &&
+        tmpl_scroll_ + rows_visible < total) {
+        tmpl_scroll_ = std::min(total - 1, tmpl_scroll_ + rows_visible);
+        redraw(); return;
+    }
+
+    if (y >= list_top && y < list_bot) {
+        int idx = tmpl_scroll_ + (int)((y - list_top) / row_h);
+        if (idx >= 0 && idx < total) {
+            if (idx == 0)      apply_template(TemplateId::Blank, "");
+            else if (idx == 1) apply_template(TemplateId::Ruled, "");
+            else if (idx == 2) apply_template(TemplateId::Grid,  "");
+            else if (idx == 3) apply_template(TemplateId::Dot,   "");
+            else {
+                const std::string &f = tmpl_custom_[idx - 4];
+                apply_template(TemplateId::Blank, "templates/" + f);
+            }
+            status_ = "template applied";
+            tmpl_open_ = false;
+            redraw();
+        }
+    }
+}
+
+void App::draw_template_picker(cairo_t *cr, int win_w, int win_h) {
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
+    cairo_rectangle(cr, 0, 0, win_w, win_h);
+    cairo_fill(cr);
+
+    double cw = std::min(560.0, win_w * 0.85);
+    double ch = std::min(880.0, win_h * 0.80);
+    double cx = (win_w - cw) / 2.0;
+    double cy = (win_h - ch) / 2.0;
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_rectangle(cr, cx, cy, cw, ch); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, cx, cy, cw, ch); cairo_stroke(cr);
+
+    PangoLayout *h = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string("Sans Bold 24");
+    pango_layout_set_font_description(h, fd);
+    pango_font_description_free(fd);
+    pango_layout_set_text(h, "Template", -1);
+    cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+    cairo_move_to(cr, cx + 24, cy + 18);
+    pango_cairo_show_layout(cr, h);
+    g_object_unref(h);
+
+    double xs = 56;
+    Rect close_r{cx + cw - xs - 12, cy + 12, xs, xs};
+    cairo_set_source_rgb(cr, 0.92, 0.92, 0.92);
+    cairo_rectangle(cr, close_r.x, close_r.y, close_r.w, close_r.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, close_r.x, close_r.y, close_r.w, close_r.h); cairo_stroke(cr);
+    PangoLayout *xl = pango_cairo_create_layout(cr);
+    fd = pango_font_description_from_string("Sans Bold 22");
+    pango_layout_set_font_description(xl, fd);
+    pango_font_description_free(fd);
+    pango_layout_set_text(xl, "X", -1);
+    cairo_move_to(cr, close_r.x + 18, close_r.y + 12);
+    pango_cairo_show_layout(cr, xl);
+    g_object_unref(xl);
+
+    std::vector<std::string> labels = {"Blank", "Ruled", "Grid", "Dots"};
+    for (auto &f : tmpl_custom_) labels.push_back(f + "  [PNG]");
+    const Page *cur = (current_page_ >= 0 &&
+                       current_page_ < (int)note_.pages.size())
+                          ? &note_.pages[current_page_] : nullptr;
+
+    double row_h = 64;
+    double list_top = cy + 80;
+    double list_bot = cy + ch - 16;
+    int rows_visible = std::max(0, (int)((list_bot - list_top) / row_h));
+    for (int i = 0; i < rows_visible; ++i) {
+        int idx = tmpl_scroll_ + i;
+        if (idx < 0 || idx >= (int)labels.size()) break;
+        double ry = list_top + i * row_h;
+
+        // Mark the active template.
+        bool active = false;
+        if (cur) {
+            if (idx < 4)
+                active = cur->bg_image.empty() && (int)cur->tmpl == idx;
+            else
+                active = cur->bg_image == ("templates/" + tmpl_custom_[idx - 4]);
+        }
+        if (active) {
+            cairo_set_source_rgb(cr, 0.90, 0.90, 0.90);
+            cairo_rectangle(cr, cx + 8, ry + 4, cw - 16, row_h - 8);
+            cairo_fill(cr);
+        }
+        cairo_set_source_rgb(cr, 0.5, 0.5, 0.5);
+        cairo_set_line_width(cr, 0.5);
+        cairo_move_to(cr, cx + 16, ry + row_h);
+        cairo_line_to(cr, cx + cw - 16, ry + row_h);
+        cairo_stroke(cr);
+
+        PangoLayout *t = pango_cairo_create_layout(cr);
+        fd = pango_font_description_from_string("Sans 18");
+        pango_layout_set_font_description(t, fd);
+        pango_font_description_free(fd);
+        pango_layout_set_text(t, labels[idx].c_str(), -1);
+        cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+        cairo_move_to(cr, cx + 24, ry + 16);
+        pango_cairo_show_layout(cr, t);
+        g_object_unref(t);
+    }
+
+    if (tmpl_scroll_ + rows_visible < (int)labels.size()) {
+        PangoLayout *t = pango_cairo_create_layout(cr);
+        fd = pango_font_description_from_string("Sans 14");
+        pango_layout_set_font_description(t, fd);
+        pango_font_description_free(fd);
+        pango_layout_set_text(t, "▼ tap bottom edge to scroll", -1);
+        cairo_set_source_rgb(cr, 0.5, 0.5, 0.5);
+        cairo_move_to(cr, cx + 24, cy + ch - 30);
+        pango_cairo_show_layout(cr, t);
+        g_object_unref(t);
+    }
+    if (tmpl_custom_.empty()) {
+        PangoLayout *t = pango_cairo_create_layout(cr);
+        fd = pango_font_description_from_string("Sans 13");
+        pango_layout_set_font_description(t, fd);
+        pango_font_description_free(fd);
+        pango_layout_set_text(t,
+            "Add custom backgrounds: drop PNGs into the vault's templates/ folder.",
+            -1);
+        pango_layout_set_width(t, (int)((cw - 48) * PANGO_SCALE));
+        cairo_set_source_rgb(cr, 0.5, 0.5, 0.5);
+        cairo_move_to(cr, cx + 24, cy + 52);
+        pango_cairo_show_layout(cr, t);
+        g_object_unref(t);
+    }
+}
+
 void App::set_rotation(int deg) {
     deg = ((deg % 360) + 360) % 360;
     if (deg != 0 && deg != 90 && deg != 180 && deg != 270) deg = 0;
@@ -877,6 +1466,11 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
     // From here on, use the drawing-space dims (portrait).
     win_w = win_w_; win_h = win_h_;
 
+    // Lay out the keyboard up front so screens that need its top edge this
+    // frame (markdown body clip + scroll) see valid geometry. The later
+    // draw pass re-lays it out idempotently before painting.
+    if (keyboard_.visible()) keyboard_.layout(win_w, win_h);
+
     if (screen_ == Screen::Browser) {
         browser_.layout(win_w, win_h, index_.entries().size());
         browser_.draw(cr, index_, win_w, win_h);
@@ -891,7 +1485,8 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
         return;
     }
 
-    toolbar_.layout(win_w);
+    toolbar_.layout(win_w, screen_ == Screen::Markdown
+                               ? ToolbarMode::Markdown : ToolbarMode::Note);
     if (screen_ == Screen::NoteView) {
         // Full-screen page; the toolbar overlays the top when visible.
         double page_w = win_w;
@@ -931,16 +1526,49 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
             cairo_stroke(cr);
         }
     } else if (screen_ == Screen::Markdown) {
-        // Splice a visible cursor marker into the buffer at cursor pos so
-        // the user can see where typing will land. U+2502 BOX DRAWINGS
-        // LIGHT VERTICAL renders as a thin vertical bar in monospace and
-        // most prose fonts; it's safe to embed in Pango markup.
-        std::string with_cursor = markdown_buf_;
-        size_t cur = std::min(markdown_cursor_, with_cursor.size());
-        with_cursor.insert(cur, "\xe2\x94\x82");  // "│"
-        double top = toolbar_.height() + 12;
-        double y = render_markdown(cr, 24, top, win_w - 48, with_cursor);
-        (void)y;
+        double top    = toolbar_.height() + 12;
+        double bottom = keyboard_.visible() ? keyboard_.top_y() : (double)win_h;
+        // Clip to the text band so scrolled-out lines don't bleed over the
+        // toolbar or keyboard.
+        cairo_save(cr);
+        cairo_rectangle(cr, 0, top, win_w, bottom - top);
+        cairo_clip(cr);
+
+        if (tool_.markdown_pretty) {
+            // Read-oriented preview: formatted markdown, no editable caret.
+            md_lines_.clear();
+            double y = render_markdown_pretty(cr, 24, top - markdown_scroll_,
+                                              win_w - 48, markdown_buf_);
+            markdown_content_h_ = (y + markdown_scroll_) - top;
+        } else {
+            double y = render_markdown(cr, 24, top - markdown_scroll_,
+                                       win_w - 48, markdown_buf_, &md_lines_);
+            markdown_content_h_ = (y + markdown_scroll_) - top;
+
+            // Caret: a thin black bar at the cursor's exact layout position.
+            double cx, cy0, cy1;
+            if (markdown_caret(cr, markdown_buf_, md_lines_, markdown_cursor_,
+                               &cx, &cy0, &cy1)) {
+                // Keep the caret on-screen while typing/navigating. Adjust
+                // scroll for the NEXT frame rather than re-laying out here.
+                if (cy0 < top) {
+                    markdown_scroll_ -= (top - cy0) + 24.0;
+                    clamp_markdown_scroll();
+                    redraw_markdown_body();
+                } else if (cy1 > bottom) {
+                    markdown_scroll_ += (cy1 - bottom) + 24.0;
+                    clamp_markdown_scroll();
+                    redraw_markdown_body();
+                } else {
+                    cairo_set_source_rgb(cr, 0, 0, 0);
+                    cairo_set_line_width(cr, 2.0);
+                    cairo_move_to(cr, cx, cy0);
+                    cairo_line_to(cr, cx, cy1);
+                    cairo_stroke(cr);
+                }
+            }
+        }
+        cairo_restore(cr);
     }
 
     if (keyboard_.visible()) {
@@ -959,6 +1587,22 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
     // Link picker modal sits on top of everything else.
     if (picker_.open) {
         draw_link_picker(cr, win_w, win_h);
+    }
+
+    // Template picker (note screen).
+    if (tmpl_open_) {
+        draw_template_picker(cr, win_w, win_h);
+    }
+
+    // Tags/rename input modal over a note (the browser handles its own above
+    // and returns early).
+    if (input_open_) {
+        draw_input_modal(cr, win_w, win_h);
+    }
+
+    // Draw/OCR modal owns the whole screen when open.
+    if (draw_open_) {
+        draw_draw_modal(cr, win_w, win_h);
     }
 
     // PDF export progress sits above even the picker.
@@ -1148,6 +1792,23 @@ bool App::on_button_press(double x, double y) {
         return true;
     }
 
+    // Draw/OCR modal swallows finger presses (drawing is pen-only via evdev);
+    // its buttons act on release.
+    if (draw_open_) return true;
+
+    // Template picker behaves like the link picker — acts on press.
+    if (tmpl_open_) { handle_template_picker_press(x, y); return true; }
+
+    // Tags/rename input modal over a note: give the keyboard press feedback.
+    if (input_open_ && screen_ != Screen::Browser) {
+        if (keyboard_.visible() && y >= keyboard_.top_y()) {
+            keyboard_.press(x, y);
+            redraw_rect(0, keyboard_.top_y(),
+                        (double)win_w_, (double)win_h_ - keyboard_.top_y());
+        }
+        return true;
+    }
+
     // Pen-preset dropdown swallows presses; the matching release selects a
     // preset or dismisses the menu.
     if (toolbar_.pen_menu_open()) return true;
@@ -1244,11 +1905,58 @@ bool App::on_button_press(double x, double y) {
         swipe_x0_ = x;
         swipe_y0_ = y;
     }
+    // Markdown body: start tracking a gesture (vertical drag = scroll,
+    // tap = position the cursor). Resolved on release.
+    if (screen_ == Screen::Markdown) {
+        swipe_active_ = true;
+        swipe_x0_ = x;
+        swipe_y0_ = y;
+        md_scroll_at_press_ = markdown_scroll_;
+    }
     return true;
 }
 
 bool App::on_button_release(double x, double y) {
     if (exporting_pdf_) return true;
+
+    // Draw/OCR modal buttons.
+    if (draw_open_) {
+        if (draw_btn_rect(0).contains(x, y)) {            // Save / commit
+            commit_draw_modal();
+        } else if (draw_btn_rect(1).contains(x, y)) {     // Clear
+            draw_strokes_.clear();
+            draw_live_ = Stroke{};
+            draw_pen_down_ = false;
+            redraw();
+        } else if (draw_btn_rect(2).contains(x, y)) {     // Cancel
+            close_draw_modal();
+        }
+        return true;
+    }
+
+    // Template picker is resolved on press; swallow the release.
+    if (tmpl_open_) return true;
+
+    // Tags/rename input modal over a note (the browser handles its own below).
+    if (input_open_ && screen_ != Screen::Browser) {
+        if (keyboard_.visible() && y >= keyboard_.top_y()) {
+            keyboard_.release(x, y);   // dispatches via on_text/on_key
+            redraw();
+            return true;
+        }
+        if (input_purpose_ == InputPurpose::Tags &&
+            tags_scope_btn_rect().contains(x, y)) {
+            commit_tags();             // keep the current scope's edits
+            tags_scope_ = (tags_scope_ == TagScope::Page) ? TagScope::Notebook
+                                                          : TagScope::Page;
+            load_tags_into_input();
+            redraw();
+            return true;
+        }
+        if (modal_btn_rect(true).contains(x, y))       commit_input();
+        else if (modal_btn_rect(false).contains(x, y)) close_input();
+        return true;
+    }
 
     if (screen_ == Screen::Browser) {
         if (confirm_open_) {
@@ -1282,7 +1990,13 @@ bool App::on_button_release(double x, double y) {
         swipe_active_ = false;
         double dx = x - swipe_x0_, dy = y - swipe_y0_;
         const double SWIPE_MIN = 120.0;
-        if (std::fabs(dx) > SWIPE_MIN && std::fabs(dx) > 2.0 * std::fabs(dy)) {
+        // Page flips are finger-only. The stylus also emits GTK pointer events
+        // while drawing, which used to register as horizontal swipes and flip
+        // the page mid-stroke. If a pen sample arrived recently, treat this
+        // gesture as stylus input and ignore the swipe.
+        bool pen_recent = (now_ms() - last_pen_ms_) < kPenSwipeGuardMs;
+        if (!pen_recent &&
+            std::fabs(dx) > SWIPE_MIN && std::fabs(dx) > 2.0 * std::fabs(dy)) {
             int np = pages_clamp(note_, current_page_ + (dx < 0 ? 1 : -1));
             if (np != current_page_) { current_page_ = np; redraw(); }
         } else if (tool_.current == Tool::Pen) {
@@ -1301,6 +2015,24 @@ bool App::on_button_release(double x, double y) {
                     }
                 }
             }
+        }
+        return true;
+    }
+
+    // Markdown body finger gesture: a vertical drag scrolls, a tap positions
+    // the cursor. swipe_active_ is only set for body presses.
+    if (screen_ == Screen::Markdown && swipe_active_) {
+        swipe_active_ = false;
+        double dx = x - swipe_x0_, dy = y - swipe_y0_;
+        const double DRAG_MIN = 24.0;
+        if (std::fabs(dy) > DRAG_MIN && std::fabs(dy) >= std::fabs(dx)) {
+            // Drag up (dy<0) reveals later content → larger scroll offset.
+            markdown_scroll_ = md_scroll_at_press_ - dy;
+            clamp_markdown_scroll();
+            redraw_markdown_body();
+        } else {
+            markdown_set_cursor_from_tap(x, y);
+            redraw_markdown_body();
         }
         return true;
     }
@@ -1390,6 +2122,26 @@ bool App::on_button_release(double x, double y) {
                 if (screen_ == Screen::Markdown) markdown_undo();
                 full_redraw = true;   // markdown body changed
                 break;
+            case ToolbarAction::MdView:
+                tool_.markdown_pretty = !tool_.markdown_pretty;
+                markdown_scroll_ = 0.0;   // line boxes differ between views
+                md_lines_.clear();
+                full_redraw = true;
+                break;
+            case ToolbarAction::InsertDrawing:
+                if (screen_ == Screen::Markdown)
+                    open_draw_modal(DrawPurpose::Image);
+                return true;   // open_draw_modal repaints
+            case ToolbarAction::OcrWord:
+                if (screen_ == Screen::Markdown)
+                    open_draw_modal(DrawPurpose::Ocr);
+                return true;
+            case ToolbarAction::Template:
+                if (screen_ == Screen::NoteView) open_template_picker();
+                return true;
+            case ToolbarAction::Tags:
+                open_tags_editor();
+                return true;   // open_tags_editor shows the modal + redraws
             case ToolbarAction::Hide:
                 toolbar_.set_visible(false);
                 // Only the toolbar strip changes (toolbar → page content),
@@ -1413,8 +2165,13 @@ bool App::on_button_release(double x, double y) {
         return true;
     }
     if (keyboard_.visible() && y >= keyboard_.top_y()) {
+        // The dispatched key edits the buffer and repaints the text band via
+        // the on_text/on_key callbacks; here we only need to un-highlight the
+        // released key, so repaint just the keyboard strip (not the whole
+        // screen). The old full redraw() was the keyboard input lag.
         keyboard_.release(x, y);
-        redraw();
+        redraw_rect(0, keyboard_.top_y(),
+                    (double)win_w_, (double)win_h_ - keyboard_.top_y());
         return true;
     }
     return true;

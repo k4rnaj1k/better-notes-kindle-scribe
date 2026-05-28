@@ -4,62 +4,92 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <string>
 
 namespace bn {
 
 namespace {
 
+std::string g_vault_root;
+
+// Loaded custom-template PNGs, keyed by resolved absolute path. Held for the
+// process lifetime (a vault has a handful of templates at most), so loading a
+// background never re-hits disk after the first page render.
+std::map<std::string, cairo_surface_t *> g_bg_cache;
+
+cairo_surface_t *load_bg(const std::string &rel) {
+    std::string path = rel;
+    // Resolve vault-relative paths; leave absolute paths as-is.
+    if (!path.empty() && path[0] != '/' && !g_vault_root.empty())
+        path = g_vault_root + "/" + rel;
+    auto it = g_bg_cache.find(path);
+    if (it != g_bg_cache.end()) return it->second;
+    cairo_surface_t *s = cairo_image_surface_create_from_png(path.c_str());
+    if (s && cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(s);
+        s = nullptr;
+    }
+    g_bg_cache.emplace(path, s);   // cache nullptr too, so we don't retry misses
+    return s;
+}
+
+// Paint a custom PNG background scaled to fill the page. Returns false when the
+// image can't be loaded so the caller can fall back to the built-in template.
+bool paint_bg_image(cairo_t *cr, const std::string &rel, double w, double h) {
+    cairo_surface_t *img = load_bg(rel);
+    if (!img) return false;
+    int iw = cairo_image_surface_get_width(img);
+    int ih = cairo_image_surface_get_height(img);
+    if (iw <= 0 || ih <= 0) return false;
+
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_paint(cr);
+    cairo_save(cr);
+    cairo_scale(cr, w / (double)iw, h / (double)ih);
+    cairo_set_source_surface(cr, img, 0, 0);
+    cairo_paint(cr);
+    cairo_restore(cr);
+    return true;
+}
+
+// Match the inkfb fast-path brush exactly: it plots a filled disc of
+// `radius = max(1, round(width/2))` along the segment, so the effective ink
+// diameter is `2*radius + 1` px of pure black. Rendering reloaded strokes at
+// that same constant width (instead of the old pressure-tapered, sub-pixel
+// quantized line) makes ink look identical before and after a page reload —
+// no more grey/narrow appearance.
+double brush_width(const Stroke &s) {
+    int radius = std::max(1, (int)std::lround(s.width * 0.5));
+    return 2.0 * radius + 1.0;
+}
+
 void render_stroke_range(cairo_t *cr, const Stroke &s, size_t from) {
+    double bw = brush_width(s);
+
     if (s.pts.size() < 2 || from >= s.pts.size() - 1) {
         // Single dot
         if (s.pts.size() == 1 && from == 0) {
             cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
-            cairo_arc(cr, s.pts[0].x, s.pts[0].y, s.width * 0.5, 0,
-                      2 * M_PI);
+            cairo_arc(cr, s.pts[0].x, s.pts[0].y, bw * 0.5, 0, 2 * M_PI);
             cairo_fill(cr);
         }
         return;
     }
-    // Pure black so the final cairo render matches the crisp black the
-    // inkfb fast-path draws (was 0.05 grey, which made strokes fade to grey
-    // once the on-screen ink settled to the cairo redraw).
+    // Pure black, constant width, round caps/joins — one stroked polyline for
+    // the whole run. cairo_stroke is expensive per call, so building a single
+    // path and stroking once keeps page reloads fast.
     cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
     cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
     cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_line_width(cr, bw);
 
-    double pmin = pen_type_pressure_min(s.pen_type);
-
-    // Quantized width of the segment starting at point i.
-    const double kQuant = 0.5;  // px buckets for batching adjacent segments
-    auto seg_w = [&](size_t i) -> double {
-        float pa = s.pts[i].pressure;     if (pa <= 0) pa = 1.0f;
-        float pb = s.pts[i + 1].pressure; if (pb <= 0) pb = 1.0f;
-        double w = s.width * (pmin + (1.0 - pmin) * (double)(pa + pb) * 0.5);
-        double wq = std::round(w / kQuant) * kQuant;
-        return wq > 0 ? wq : kQuant;
-    };
-
-    // cairo_stroke is expensive per call (it builds + rasterises the stroke
-    // geometry each time), so coalesce consecutive segments that share a
-    // width into one path and stroke once. Constant-width pens collapse to a
-    // single path for the whole stroke; the pressure-tapered pencil batches
-    // runs of similar pressure. This turns the O(points) stroke calls — the
-    // dominant cost when opening notes or flipping pages — into O(width-runs).
     size_t n = s.pts.size();
     size_t i = std::max<size_t>(from, 0);
-    while (i + 1 < n) {
-        double wq = seg_w(i);
-        cairo_set_line_width(cr, wq);
-        cairo_move_to(cr, s.pts[i].x, s.pts[i].y);
-        cairo_line_to(cr, s.pts[i + 1].x, s.pts[i + 1].y);
-        size_t j = i + 1;
-        while (j + 1 < n && seg_w(j) == wq) {
-            cairo_line_to(cr, s.pts[j + 1].x, s.pts[j + 1].y);
-            ++j;
-        }
-        cairo_stroke(cr);
-        i = j;
-    }
+    cairo_move_to(cr, s.pts[i].x, s.pts[i].y);
+    for (size_t j = i + 1; j < n; ++j)
+        cairo_line_to(cr, s.pts[j].x, s.pts[j].y);
+    cairo_stroke(cr);
 }
 
 } // namespace
@@ -72,8 +102,11 @@ void canvas_render_stroke_live(cairo_t *cr, const Stroke &s, size_t from_idx) {
     render_stroke_range(cr, s, from_idx);
 }
 
+void canvas_set_vault_root(const std::string &root) { g_vault_root = root; }
+
 void canvas_render_page(cairo_t *cr, const Page &p, double w, double h) {
-    draw_template(cr, w, h, p.tmpl);
+    if (p.bg_image.empty() || !paint_bg_image(cr, p.bg_image, w, h))
+        draw_template(cr, w, h, p.tmpl);
     for (auto &s : p.strokes) canvas_render_stroke(cr, s);
 }
 

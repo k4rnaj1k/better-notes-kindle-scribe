@@ -25,7 +25,16 @@ enum class ToolbarAction {
     Undo,   // only meaningful in Markdown screen for now
     Exit,   // quit the app
     Hide,   // collapse the toolbar
+    MdView,        // markdown: toggle source ↔ pretty view
+    InsertDrawing, // markdown: open the draw-to-attachment modal
+    OcrWord,       // markdown: draw a word, OCR it, insert at cursor
+    Tags,          // edit tags for the current note/page
+    Template,      // note: open the template picker
 };
+
+// The toolbar shows a different button set per screen so markdown-only and
+// note-only actions don't clutter each other.
+enum class ToolbarMode { Note, Markdown };
 
 struct ToolbarButton {
     Rect           rect;
@@ -36,7 +45,7 @@ struct ToolbarButton {
 
 class Toolbar {
 public:
-    void layout(double width);                          // computes rects
+    void layout(double width, ToolbarMode mode = ToolbarMode::Note);
     void draw(cairo_t *cr, const ToolState &st,
               const std::string &status, int page, int total);
 
