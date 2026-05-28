@@ -118,9 +118,12 @@ int App::run(int argc, char *argv[]) {
         set_rotation(std::atoi(r));
     }
 
-    // Direct-to-framebuffer ink path. Skipped if BN_DISABLE_INKFB=1 set
-    // (useful for testing on hosts where /dev/fb0 isn't the e-ink panel).
-    if (!std::getenv("BN_DISABLE_INKFB")) {
+    // Direct-to-framebuffer ink path. OPT-IN via BN_ENABLE_INKFB=1: under
+    // the Kindle's X server, direct /dev/fb0 writes can be composited over
+    // or land in the wrong buffer, so this is off by default. When enabled
+    // it runs *in addition* to the GTK partial redraw, giving instant A2
+    // feedback while the cairo path still guarantees a correct final image.
+    if (std::getenv("BN_ENABLE_INKFB")) {
         inkfb_init(rotation_);
     }
 
@@ -253,17 +256,26 @@ void App::process_async_events() {
                     (float)std::max(1, pen_.calibration().max_pressure);
                 p.t_ms = s.t_ms;
 
-                // Two paths:
-                //   * inkfb_available(): write the segment straight to the
-                //     e-ink framebuffer with the A2 waveform — ~30 ms ghost
-                //     instead of ~150-500 ms through X11. The final pretty
-                //     render still happens via cairo on pen-up.
-                //   * fallback: queue a partial redraw of the new segment.
+                // redraw_rect / inkfb want DRAWING-space coords (y=0 at
+                // the window top), but stroke points are page-local, so add
+                // the toolbar height back for the dirty-rect / fb segment.
+                double th = toolbar_.height();
+
+                // Always queue a GTK partial redraw of the new segment so
+                // the stroke is visible mid-draw (this is the reliable path
+                // under X). If inkfb is enabled, *also* push the segment to
+                // the framebuffer for instant A2 feedback on top.
                 if (!live_stroke_.pts.empty()) {
                     const Point &prev = live_stroke_.pts.back();
+                    double minx = std::min(prev.x, p.x) - live_stroke_.width;
+                    double miny = std::min(prev.y, p.y) - live_stroke_.width;
+                    double maxx = std::max(prev.x, p.x) + live_stroke_.width;
+                    double maxy = std::max(prev.y, p.y) + live_stroke_.width;
+                    redraw_rect(minx, miny + th, maxx - minx, maxy - miny);
+
                     if (inkfb_available()) {
-                        InkRect r = inkfb_draw_segment(prev.x, prev.y,
-                                                       p.x, p.y,
+                        InkRect r = inkfb_draw_segment(prev.x, prev.y + th,
+                                                       p.x, p.y + th,
                                                        live_stroke_.width);
                         if (live_ink_bbox_.w == 0) {
                             live_ink_bbox_ = r;
@@ -276,16 +288,10 @@ void App::process_async_events() {
                                               r.y + r.h);
                             live_ink_bbox_ = {ax, ay, bx - ax, by - ay};
                         }
-                    } else {
-                        double minx = std::min(prev.x, p.x) - live_stroke_.width;
-                        double miny = std::min(prev.y, p.y) - live_stroke_.width;
-                        double maxx = std::max(prev.x, p.x) + live_stroke_.width;
-                        double maxy = std::max(prev.y, p.y) + live_stroke_.width;
-                        redraw_rect(minx, miny, maxx - minx, maxy - miny);
                     }
-                } else if (!inkfb_available()) {
+                } else {
                     redraw_rect(p.x - live_stroke_.width,
-                                p.y - live_stroke_.width,
+                                p.y - live_stroke_.width + th,
                                 live_stroke_.width * 2,
                                 live_stroke_.width * 2);
                 }
@@ -295,6 +301,9 @@ void App::process_async_events() {
                 pen_down_ = false;
                 if (!live_stroke_.pts.empty() &&
                     current_page_ < (int)note_.pages.size()) {
+                    // Bbox (page-local) of the finished stroke, before move.
+                    Rect bb = live_stroke_.bbox();
+                    double sw = live_stroke_.width;
                     note_.pages[current_page_].strokes.push_back(
                         std::move(live_stroke_));
                     live_stroke_ = Stroke{};
@@ -303,14 +312,18 @@ void App::process_async_events() {
                         ocr_.notify(note_, current_page_, win_w_,
                                     win_h_ - (int)toolbar_.height() - 36);
                     }
-                    // Snap the A2 ghost from the fast-path into a clean
-                    // GC16 grey, then let GTK rerender the whole region
-                    // via cairo so the stroke matches saved-state pixels.
                     if (inkfb_available() && live_ink_bbox_.w > 0) {
+                        // Snap the A2 ghost into clean GC16 grey.
                         inkfb_settle(live_ink_bbox_);
                     }
                     live_ink_bbox_ = {0, 0, 0, 0};
-                    redraw();
+                    // Repaint ONLY the stroke's region (page-local → drawing
+                    // space via + toolbar height). A full redraw() here would
+                    // trigger a slow full-screen e-ink refresh (~1 s); the
+                    // committed stroke occupies the same pixels the live
+                    // segments already drew, so a partial repaint suffices.
+                    redraw_rect(bb.x - sw, bb.y - sw + toolbar_.height(),
+                                bb.w + 2 * sw, bb.h + 2 * sw);
                 }
             }
         } else if (tool_.current == Tool::Eraser) {
@@ -359,14 +372,12 @@ void App::process_async_events() {
             l.page   = r.page;
             l.target = name;  // store the wiki-style name; resolved at follow time
             if (i < r.word_rects.size() && r.word_rects[i].w > 0) {
-                // Tesseract gives page-image coords (0 = top of page).
-                // Link rects are stored in window-relative coords (0 =
-                // top of window), so shift by the toolbar's height.
+                // Tesseract gives page-image coords (0 = top of page),
+                // which is exactly our page-local space — store as-is.
                 l.rect = r.word_rects[i];
-                l.rect.y += toolbar_.height();
             } else {
                 // Placeholder when we don't have a word bbox.
-                l.rect = {40, toolbar_.height() + 40 + (double)i * 32, 220, 28};
+                l.rect = {40, 40 + (double)i * 32, 220, 28};
             }
             note_.links.push_back(l);
             note_.mark_dirty();
@@ -385,9 +396,14 @@ void App::map_pen_to_page(const PenSample &s, double &px, double &py) {
     if (c.invert_x) nx = 1.0 - nx;
     if (c.invert_y) ny = 1.0 - ny;
     if (c.swap_xy) std::swap(nx, ny);
+    // The pen's physical range spans the WHOLE screen, so map it to the
+    // full window height first, then subtract the toolbar height to land
+    // in page-local space (y=0 = top of page content, which on_draw
+    // re-translates down by the toolbar height). This makes the ink appear
+    // exactly under the pen instead of drifting downward. Touching the
+    // toolbar strip maps to negative py (above the page = not drawn).
     px = nx * (double)win_w_;
-    py = toolbar_.height() + ny *
-        (double)std::max(0, win_h_ - (int)toolbar_.height() - 36);
+    py = ny * (double)win_h_ - toolbar_.height();
 }
 
 void App::enter_browser() {
@@ -577,10 +593,9 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
             cairo_set_line_width(cr, 1.0);
             static const double dashes[] = {4, 3};
             cairo_set_dash(cr, dashes, 2, 0);
-            cairo_move_to(cr, lasso_.pts[0].x, lasso_.pts[0].y - toolbar_.height());
+            cairo_move_to(cr, lasso_.pts[0].x, lasso_.pts[0].y);
             for (size_t i = 1; i < lasso_.pts.size(); ++i)
-                cairo_line_to(cr, lasso_.pts[i].x,
-                                  lasso_.pts[i].y - toolbar_.height());
+                cairo_line_to(cr, lasso_.pts[i].x, lasso_.pts[i].y);
             cairo_stroke(cr);
             cairo_set_dash(cr, nullptr, 0, 0);
         }
@@ -588,8 +603,7 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
         for (auto &l : note_.links) {
             if (l.page != current_page_) continue;
             cairo_set_source_rgba(cr, 0, 0, 1, 0.05);
-            cairo_rectangle(cr, l.rect.x, l.rect.y - toolbar_.height(),
-                            l.rect.w, l.rect.h);
+            cairo_rectangle(cr, l.rect.x, l.rect.y, l.rect.w, l.rect.h);
             cairo_fill_preserve(cr);
             cairo_set_source_rgba(cr, 0, 0, 1, 0.4);
             cairo_set_line_width(cr, 1.0);
@@ -831,9 +845,10 @@ bool App::on_button_press(double x, double y) {
         return true;
     }
 
-    // Tap-to-follow inside a link rect (Pen tool, single tap)
+    // Tap-to-follow inside a link rect (Pen tool, single tap). Link rects
+    // are page-local, so shift the tap into page space first.
     if (screen_ == Screen::NoteView && tool_.current == Tool::Pen) {
-        const Link *l = link_at(note_, current_page_, x, y);
+        const Link *l = link_at(note_, current_page_, x, y - toolbar_.height());
         if (l) {
             // Resolve against the vault — handles bare names ("MyNote"),
             // sub-folder paths ("work/meeting"), .md vs note-dir, and
@@ -903,6 +918,17 @@ bool App::on_button_release(double x, double y) {
             case ToolbarAction::Browser: enter_browser(); break;
             case ToolbarAction::Undo:
                 if (screen_ == Screen::Markdown) markdown_undo();
+                break;
+            case ToolbarAction::Exit:
+                // Persist outstanding work before tearing down. The rest of
+                // the shutdown (ocr/pen/inkfb stop) runs in run()'s epilogue
+                // after gtk_main() returns.
+                if (markdown_dirty_ && !markdown_path_.empty()) {
+                    write_file(markdown_path_, markdown_buf_);
+                    markdown_dirty_ = false;
+                }
+                if (note_.dirty) save_current();
+                gtk_main_quit();
                 break;
             default: break;
         }

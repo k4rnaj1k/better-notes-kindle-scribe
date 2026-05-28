@@ -114,6 +114,33 @@ jobs:
             ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/pkgconfig/tesseract.pc
           key: ocr-${{ hashFiles('deps/build-tesseract.sh') }}
 
+      - name: Restore cached FBInk
+        id: cache-fbink
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/include/fbink.h
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/libfbink.a
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/pkgconfig/fbink.pc
+          key: fbink-${{ hashFiles('deps/build-fbink.sh') }}
+
+      - name: Build FBInk for ${{ env.TARGET }}
+        if: steps.cache-fbink.outputs.cache-hit != 'true'
+        run: |
+          export PATH="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/bin:$PATH"
+          export SYSROOT="$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/arm-${TARGET}-linux-gnueabihf/sysroot"
+          bash deps/build-fbink.sh
+
+      - name: Save FBInk cache
+        if: steps.cache-fbink.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/include/fbink.h
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/libfbink.a
+            ~/x-tools/arm-kindlehf-linux-gnueabihf/arm-kindlehf-linux-gnueabihf/sysroot/usr/lib/pkgconfig/fbink.pc
+          key: fbink-${{ hashFiles('deps/build-fbink.sh') }}
+
       - name: Set env
         run: |
           echo "MESON_CROSS=$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/meson-crosscompile.txt" >> $GITHUB_ENV

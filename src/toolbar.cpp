@@ -44,50 +44,44 @@ void draw_button(cairo_t *cr, const ToolbarButton &b,
 
 void Toolbar::layout(double width) {
     width_  = width;
-    // Buttons sized for finger taps on the Scribe — minimum ~120 px square
-    // is a comfortable target. Was 92×64; now 120×100.
+    // Tall toolbar for finger-friendly tap targets. Button *width* is
+    // computed to fit every button in one row, so it scales with the
+    // (rotated, portrait) screen width instead of overflowing.
     height_ = 120.0;
-    const double m = 10.0;
-    const double bw = 120.0, bh = height_ - 2 * m;
-    const double gap = 8.0;
+    const double m = 8.0;
+    const double gap = 6.0;
     buttons_.clear();
-    auto add = [&](const char *label, ToolbarAction a) {
+
+    struct Def { const char *label; ToolbarAction action; };
+    static const Def defs[] = {
+        {"\xe2\x9c\x8f Pen", ToolbarAction::Pen},
+        {"Erase",            ToolbarAction::Eraser},
+        {"Lasso",            ToolbarAction::Lasso},
+        {"Kbd",              ToolbarAction::Keyboard},
+        {"OCR",              ToolbarAction::OcrToggle},
+        {"Undo",             ToolbarAction::Undo},
+        {"Save",             ToolbarAction::Save},
+        {"PDF",              ToolbarAction::ExportPdf},
+        {"+Pg",              ToolbarAction::AddPage},
+        {"<",                ToolbarAction::PrevPage},
+        {">",                ToolbarAction::NextPage},
+        {"\xe2\x86\x90",     ToolbarAction::Back},
+        {"Notes",            ToolbarAction::Browser},
+        {"Exit",             ToolbarAction::Exit},
+    };
+    const int n = (int)(sizeof(defs) / sizeof(defs[0]));
+    double bh = height_ - 2 * m;
+    double bw = (width_ - 2 * m - (n - 1) * gap) / n;
+    for (int i = 0; i < n; ++i) {
         ToolbarButton b{};
-        b.label = label;
-        b.action = a;
-        b.rect.x = m + buttons_.size() * (bw + gap);
+        b.label  = defs[i].label;
+        b.action = defs[i].action;
+        b.rect.x = m + i * (bw + gap);
         b.rect.y = m;
         b.rect.w = bw;
         b.rect.h = bh;
         buttons_.push_back(b);
-    };
-    add("\xe2\x9c\x8f Pen",    ToolbarAction::Pen);
-    add("Eraser",              ToolbarAction::Eraser);
-    add("Lasso",               ToolbarAction::Lasso);
-    add("Keyb",                ToolbarAction::Keyboard);
-    add("OCR",                 ToolbarAction::OcrToggle);
-    add("Undo",                ToolbarAction::Undo);
-    add("Save",                ToolbarAction::Save);
-    add("PDF",                 ToolbarAction::ExportPdf);
-    add("+ Page",              ToolbarAction::AddPage);
-    add("<",                   ToolbarAction::PrevPage);
-    add(">",                   ToolbarAction::NextPage);
-    // Right-aligned: Back + Browser
-    ToolbarButton home{};
-    home.label = "Notes";
-    home.action = ToolbarAction::Browser;
-    home.rect.x = width_ - m - bw;
-    home.rect.y = m;
-    home.rect.w = bw; home.rect.h = bh;
-    buttons_.push_back(home);
-
-    ToolbarButton back{};
-    back.label = "\xe2\x86\x90 Back";
-    back.action = ToolbarAction::Back;
-    back.rect.x = width_ - m - 2 * bw - gap;
-    back.rect.y = m;
-    back.rect.w = bw; back.rect.h = bh;
-    buttons_.push_back(back);
+    }
 }
 
 void Toolbar::draw(cairo_t *cr, const ToolState &st,
@@ -109,7 +103,7 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
             case ToolbarAction::OcrToggle: active = st.ocr_enabled; break;
             default: break;
         }
-        draw_button(cr, b, active, 18);
+        draw_button(cr, b, active, 15);
     }
 
     // Status pill: tool name + page n/N

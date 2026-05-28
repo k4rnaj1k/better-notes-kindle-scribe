@@ -10,22 +10,33 @@ NOTES_DIR="/mnt/us/documents/betternotes"
 
 mkdir -p "$NOTES_DIR"
 
-if [ -f "$MARKER" ]; then
-    echo "BetterNotes already running"
-    exit 0
-fi
+# Kill any stale instance. A previous betternotes still holding the
+# executable open causes "Text file busy" (ETXTBSY) on exec, and a
+# leftover marker file from a crash would otherwise block relaunch.
+pkill -f "$EXT_DIR/bin/betternotes" 2>/dev/null
+# Wait (whole-second sleeps — busybox may lack fractional sleep) for the
+# old process to die and release the executable's text segment. Escalate
+# to SIGKILL if it's still around after a few seconds.
+i=0
+while pgrep -f "$EXT_DIR/bin/betternotes" >/dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -ge 4 ]; then
+        pkill -9 -f "$EXT_DIR/bin/betternotes" 2>/dev/null
+    fi
+    if [ "$i" -ge 6 ]; then
+        break
+    fi
+    sleep 1
+done
+rm -f "$MARKER"
 echo "active" > "$MARKER"
 
-# Freeze framework
+# Freeze framework. NOTE: we do NOT touch screen orientation here — the
+# Kindle X server can't rotate (no XRandR), so betternotes rotates its own
+# rendering in software (cairo). The old `eips -o U` call was both wrong
+# (eips treats "U"/"-o" as bitmap filenames) and unnecessary.
 lipc-set-prop com.lab126.pillow disableEnablePillow disable 2>/dev/null
 lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
-
-# Lock the framebuffer to portrait ("U" = upright). Without this the
-# Scribe framework can leave the screen in landscape, which makes the
-# UI appear rotated 90 deg and breaks the pen swap_xy calibration.
-lipc-set-prop com.lab126.winmgr orientationLock U 2>/dev/null
-# Force the eink driver upright too, in case winmgr doesn't reach it.
-eips -o U 2>/dev/null || eips -u -o 0 2>/dev/null
 
 "$EXT_DIR/bin/betternotes" \
     --notes-dir "$NOTES_DIR" \
@@ -42,5 +53,4 @@ rm -f "$MARKER"
 # Thaw framework
 lipc-set-prop com.lab126.pillow disableEnablePillow enable 2>/dev/null
 lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null
-lipc-set-prop com.lab126.winmgr orientationLock FREE 2>/dev/null
 lipc-send-event com.lab126.hal.usbError cycled 2>/dev/null

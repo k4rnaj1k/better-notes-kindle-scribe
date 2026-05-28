@@ -49,13 +49,10 @@ public:
     bool on_motion(double x, double y);
 
     void draw_link_picker(cairo_t *cr, int win_w, int win_h);
-    void handle_picker_press(double x, double y);
 
-    // Markdown helpers
-    void markdown_snapshot();
-    void markdown_undo();
-    void markdown_insert(const std::string &text);
-    void markdown_backspace();
+    // X11 window coords → drawing-space coords (inverse of the cairo
+    // rotation applied in on_draw). Public: called by the GTK trampolines.
+    void screen_to_drawing(double sx, double sy, double &dx, double &dy) const;
 
     // Called from pen_reader thread; just enqueues onto pen_queue_.
     void on_pen_sample(const PenSample &s);
@@ -65,6 +62,14 @@ public:
 
 private:
     App();
+
+    void handle_picker_press(double x, double y);
+
+    // Markdown helpers
+    void markdown_snapshot();
+    void markdown_undo();
+    void markdown_insert(const std::string &text);
+    void markdown_backspace();
 
     // --- screen routing ---
     void enter_browser();
@@ -93,10 +98,6 @@ private:
     // swapped relative to the X window allocation.
     int  draw_w() const { return (rotation_ == 90 || rotation_ == 270) ? xh_ : xw_; }
     int  draw_h() const { return (rotation_ == 90 || rotation_ == 270) ? xw_ : xh_; }
-
-    // X11 window coords → drawing-space coords (inverse of the cairo
-    // rotation applied in on_draw).
-    void screen_to_drawing(double sx, double sy, double &dx, double &dy) const;
 
     // --- state ---
     GtkWidget    *window_  = nullptr;

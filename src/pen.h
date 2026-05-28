@@ -33,14 +33,15 @@ struct PenCalibration {
     int min_x = 0, max_x = 20967;   // Scribe Wacom defaults; auto-overridden
     int min_y = 0, max_y = 15725;
     int max_pressure = 4095;
-    // Defaults assume the screen is locked portrait (launch.sh does this).
-    // The digitizer on the Scribe reports landscape-native coords, so we
-    // swap and invert Y to land them on the portrait surface. Override at
-    // runtime with env vars BN_PEN_SWAP_XY / BN_PEN_INVERT_X / BN_PEN_INVERT_Y
-    // (values: 0 or 1) to try other combinations on-device.
+    // Maps the Scribe's landscape-native digitizer onto our 90°-rotated
+    // (portrait) drawing surface. After swap_xy, the horizontal screen axis
+    // (px) is driven by the device Y channel and the vertical axis (py) by
+    // the device X channel — so invert_y mirrors horizontally and invert_x
+    // mirrors vertically. Override per-axis at runtime with env vars
+    // BN_PEN_SWAP_XY / BN_PEN_INVERT_X / BN_PEN_INVERT_Y (each 0 or 1).
     bool swap_xy  = true;
-    bool invert_x = false;
-    bool invert_y = true;
+    bool invert_x = true;
+    bool invert_y = false;
 };
 
 // Starts the background pen reader thread. cb is invoked on the reader

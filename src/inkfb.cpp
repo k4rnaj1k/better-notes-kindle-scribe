@@ -1,197 +1,183 @@
 #include "inkfb.h"
+
+#if !BN_HAVE_FBINK
+
+// FBInk not available (e.g. host build) — compile to no-op stubs so the
+// app falls back to the GTK partial-redraw path.
+namespace bn {
+bool    inkfb_init(int)          { return false; }
+bool    inkfb_available()        { return false; }
+int     inkfb_screen_w()         { return 0; }
+int     inkfb_screen_h()         { return 0; }
+InkRect inkfb_draw_segment(double, double, double, double, double) {
+    return InkRect{0, 0, 0, 0};
+}
+void    inkfb_settle(InkRect)    {}
+void    inkfb_close()            {}
+} // namespace bn
+
+#else
+
 #include "util.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <fcntl.h>
-#include <linux/fb.h>
-#include <linux/ioctl.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <cstdlib>
+
+#include <fbink.h>
+
+// Direct-to-framebuffer ink via FBInk.
+//
+// We do NOT hand-roll the mxcfb ioctl any more: the Kindle Scribe is an MTK
+// device and needs mxcfb_update_data_mtk + MXCFB_SEND_UPDATE_MTK + MTK
+// waveform numbering. FBInk auto-detects the device and does the right
+// thing, so we delegate the refresh to it. We draw the stroke with FBInk's
+// rotation-aware rect fill (fbink_fill_rect_rgba) instead of poking raw fb
+// memory, which also means FBInk handles the panel's native rotation.
+//
+// Coordinates: inkfb_draw_segment receives DRAWING-space (portrait) coords
+// from the App. We map them to the X framebuffer's screen layout exactly
+// like App::redraw_rect does, then hand FBInk *unrotated* fb coordinates
+// (no_rota = true), because those screen coords are already in the raw fb
+// layout the X server renders into.
 
 namespace bn {
 
 namespace {
 
-// ---- NXP MXC ePDC ioctl interface (Lab126 driver) -----------------------
-// The Kindle Scribe ships the imx_epdc_fb driver. Constants below are the
-// stable subset used by koreader's blitbuffer and the kindle-tablet
-// daemon. We deliberately use the v1 struct layout — it works on every
-// Lab126 board from PW3 onward including Scribe.
+int        g_fbfd = -1;
+bool       g_ok = false;
+int        g_rotation = 90;
+int        g_screen_w = 0;     // raw fb (X landscape) dimensions
+int        g_screen_h = 0;
+FBInkConfig g_draw_cfg = {};   // for fills: black, no per-call refresh
+FBInkConfig g_rfx_cfg  = {};   // for the explicit refresh: WFM_DU, fast
 
-struct mxcfb_rect {
-    uint32_t top, left, width, height;
-};
-
-struct mxcfb_alt_buffer_data {
-    uint32_t phys_addr;
-    uint32_t width, height;
-    mxcfb_rect alt_update_region;
-};
-
-struct mxcfb_update_data {
-    mxcfb_rect update_region;
-    uint32_t   waveform_mode;
-    uint32_t   update_mode;
-    uint32_t   update_marker;
-    int        temp;
-    unsigned   flags;
-    mxcfb_alt_buffer_data alt_buffer_data;
-};
-
-#ifndef MXCFB_SEND_UPDATE
-#define MXCFB_SEND_UPDATE _IOW('F', 0x2E, mxcfb_update_data)
-#endif
-
-// Waveform modes — A2 is the fast 2-bit "animation" mode, perfect for ink.
-// GC16 is the high-quality 16-grey mode used when the stroke settles.
-constexpr uint32_t WAVEFORM_A2     = 4;
-constexpr uint32_t WAVEFORM_GC16   = 2;
-constexpr uint32_t TEMP_USE_AMBIENT = 0x1000;
-constexpr uint32_t UPDATE_MODE_PARTIAL = 0x0;
-
-// ---- module state -------------------------------------------------------
-struct FbState {
-    int        fd = -1;
-    uint8_t   *mem = nullptr;
-    size_t     mem_len = 0;
-    fb_var_screeninfo var{};
-    fb_fix_screeninfo fix{};
-    int        rotation_deg = 90;   // drawing → screen rotation
-    bool       ok = false;
-    uint32_t   marker = 1;
-};
-
-FbState g_fb;
-
-// Map drawing-space → screen-space (the inverse of cairo's transform).
-// Matches the math in App::redraw_rect — keep these in sync.
+// drawing-space → raw fb (screen) point. Mirrors App::redraw_rect / the old
+// inkfb drawing_to_screen_pt. Keep in sync with app.cpp.
 void drawing_to_screen_pt(double dx, double dy, int &sx, int &sy) {
-    int xw = (int)g_fb.var.xres;
-    int xh = (int)g_fb.var.yres;
-    switch (g_fb.rotation_deg) {
-    case 90:  sx = xw - (int)dy; sy = (int)dx; break;
-    case 180: sx = xw - (int)dx; sy = xh - (int)dy; break;
-    case 270: sx = (int)dy;      sy = xh - (int)dx; break;
-    default:  sx = (int)dx;      sy = (int)dy; break;
+    switch (g_rotation) {
+    case 90:  sx = g_screen_w - (int)dy; sy = (int)dx; break;
+    case 180: sx = g_screen_w - (int)dx; sy = g_screen_h - (int)dy; break;
+    case 270: sx = (int)dy;              sy = g_screen_h - (int)dx; break;
+    default:  sx = (int)dx;              sy = (int)dy; break;
     }
 }
 
-// Plot a single pixel as black (intensity 0) into the fb. Handles the
-// common Kindle bpps: 8 (Y8), 16 (RGB565), 32 (XRGB8888).
-void plot_pixel(int sx, int sy) {
-    if (sx < 0 || sy < 0 ||
-        sx >= (int)g_fb.var.xres || sy >= (int)g_fb.var.yres) return;
-    size_t off = (size_t)sy * g_fb.fix.line_length +
-                 (size_t)sx * (g_fb.var.bits_per_pixel / 8);
-    if (off >= g_fb.mem_len) return;
-    switch (g_fb.var.bits_per_pixel) {
-    case 8:  g_fb.mem[off] = 0x00; break;
-    case 16: *reinterpret_cast<uint16_t *>(g_fb.mem + off) = 0x0000; break;
-    case 32: *reinterpret_cast<uint32_t *>(g_fb.mem + off) = 0xFF000000; break;
-    }
-}
-
-// Bresenham line with a circular brush of `radius` for stroke width.
-void rasterise_line(int x0, int y0, int x1, int y1, int radius) {
-    int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    while (true) {
-        for (int oy = -radius; oy <= radius; ++oy) {
-            for (int ox = -radius; ox <= radius; ++ox) {
-                if (ox * ox + oy * oy <= radius * radius)
-                    plot_pixel(x0 + ox, y0 + oy);
-            }
-        }
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
-
-void send_update(const InkRect &r, uint32_t waveform) {
-    if (!g_fb.ok || r.w <= 0 || r.h <= 0) return;
-    mxcfb_update_data u{};
-    u.update_region.left   = std::max(0, r.x);
-    u.update_region.top    = std::max(0, r.y);
-    u.update_region.width  = (uint32_t)r.w;
-    u.update_region.height = (uint32_t)r.h;
-    u.waveform_mode  = waveform;
-    u.update_mode    = UPDATE_MODE_PARTIAL;
-    u.update_marker  = g_fb.marker++;
-    u.temp           = TEMP_USE_AMBIENT;
-    u.flags          = 0;
-    ioctl(g_fb.fd, MXCFB_SEND_UPDATE, &u);
-}
+void clampi(int &v, int lo, int hi) { v = std::max(lo, std::min(hi, v)); }
 
 } // namespace
 
 bool inkfb_init(int rotation_deg) {
-    g_fb.rotation_deg = rotation_deg;
-    g_fb.fd = ::open("/dev/fb0", O_RDWR);
-    if (g_fb.fd < 0) { log_err("inkfb: open /dev/fb0 failed"); return false; }
-    if (ioctl(g_fb.fd, FBIOGET_VSCREENINFO, &g_fb.var) != 0 ||
-        ioctl(g_fb.fd, FBIOGET_FSCREENINFO, &g_fb.fix) != 0) {
-        log_err("inkfb: FBIOGET_*SCREENINFO failed");
-        ::close(g_fb.fd); g_fb.fd = -1; return false;
+    g_rotation = rotation_deg;
+
+    g_fbfd = fbink_open();
+    if (g_fbfd < 0) { log_err("inkfb: fbink_open failed"); return false; }
+
+    // Fast B&W waveform for the live stroke. is_flashing=false keeps it a
+    // PARTIAL update; no_refresh handled per-call.
+    g_rfx_cfg = FBInkConfig{};
+    g_rfx_cfg.wfm_mode    = WFM_DU;     // ~260ms full-quality DU; A2 is faster but B&W-only
+    g_rfx_cfg.is_flashing = false;
+    g_rfx_cfg.no_refresh  = false;
+
+    if (fbink_init(g_fbfd, &g_rfx_cfg) < 0) {
+        log_err("inkfb: fbink_init failed");
+        fbink_close(g_fbfd); g_fbfd = -1; return false;
     }
-    g_fb.mem_len = (size_t)g_fb.fix.line_length * g_fb.var.yres;
-    g_fb.mem = (uint8_t *)mmap(nullptr, g_fb.mem_len, PROT_READ | PROT_WRITE,
-                                MAP_SHARED, g_fb.fd, 0);
-    if (g_fb.mem == MAP_FAILED) {
-        log_err("inkfb: mmap failed (len=%zu)", g_fb.mem_len);
-        g_fb.mem = nullptr;
-        ::close(g_fb.fd); g_fb.fd = -1;
-        return false;
-    }
-    log_info("inkfb: ok  %dx%d  bpp=%u  stride=%u  rotation=%d",
-             g_fb.var.xres, g_fb.var.yres, g_fb.var.bits_per_pixel,
-             g_fb.fix.line_length, rotation_deg);
-    g_fb.ok = true;
+
+    FBInkState st = {};
+    fbink_get_state(&g_rfx_cfg, &st);
+    g_screen_w = (int)st.screen_width;
+    g_screen_h = (int)st.screen_height;
+    log_info("inkfb: fbink ok  screen=%ux%u  bpp=%u  stride=%u  rota=%u",
+             st.screen_width, st.screen_height, st.bpp,
+             st.scanline_stride, st.current_rota);
+
+    // Draw config: fill black, never refresh per-fill (we batch one refresh
+    // per segment). We pass colour explicitly via fbink_fill_rect_rgba, so
+    // fg/bg here are mostly irrelevant.
+    g_draw_cfg = FBInkConfig{};
+    g_draw_cfg.no_refresh = true;
+
+    g_ok = true;
     return true;
 }
 
-bool inkfb_available() { return g_fb.ok; }
-int  inkfb_screen_w() { return g_fb.ok ? (int)g_fb.var.xres : 0; }
-int  inkfb_screen_h() { return g_fb.ok ? (int)g_fb.var.yres : 0; }
+bool inkfb_available() { return g_ok; }
+int  inkfb_screen_w() { return g_ok ? g_screen_w : 0; }
+int  inkfb_screen_h() { return g_ok ? g_screen_h : 0; }
 
 InkRect inkfb_draw_segment(double x0, double y0,
                             double x1, double y1,
                             double width) {
     InkRect bbox{0, 0, 0, 0};
-    if (!g_fb.ok) return bbox;
+    if (!g_ok) return bbox;
+
     int sx0, sy0, sx1, sy1;
     drawing_to_screen_pt(x0, y0, sx0, sy0);
     drawing_to_screen_pt(x1, y1, sx1, sy1);
-    int radius = std::max(1, (int)std::round(width * 0.5));
-    rasterise_line(sx0, sy0, sx1, sy1, radius);
+    int radius = std::max(1, (int)std::lround(width * 0.5));
+    int diam   = radius * 2;
 
-    int minx = std::min(sx0, sx1) - radius - 1;
-    int miny = std::min(sy0, sy1) - radius - 1;
-    int maxx = std::max(sx0, sx1) + radius + 1;
-    int maxy = std::max(sy0, sy1) + radius + 1;
-    bbox.x = std::max(0, minx);
-    bbox.y = std::max(0, miny);
-    bbox.w = std::min((int)g_fb.var.xres, maxx) - bbox.x;
-    bbox.h = std::min((int)g_fb.var.yres, maxy) - bbox.y;
-    send_update(bbox, WAVEFORM_A2);
+    // Walk the segment placing small black squares — a poor-man's brush
+    // that approximates a round-capped line. Each fill is no_refresh; we
+    // issue a single fast refresh over the union bbox at the end.
+    int dx = std::abs(sx1 - sx0), sx = sx0 < sx1 ? 1 : -1;
+    int dy = -std::abs(sy1 - sy0), sy = sy0 < sy1 ? 1 : -1;
+    int err = dx + dy;
+    int x = sx0, y = sy0;
+    int step = std::max(1, radius);  // don't fill every pixel; overlap by radius
+    int since = step;  // force a fill on the first point
+    while (true) {
+        if (since >= step || (x == sx1 && y == sy1)) {
+            FBInkRect r;
+            r.left   = (unsigned short)std::max(0, x - radius);
+            r.top    = (unsigned short)std::max(0, y - radius);
+            r.width  = (unsigned short)diam;
+            r.height = (unsigned short)diam;
+            // no_rota=true: coords are already in raw fb layout.
+            fbink_fill_rect_rgba(g_fbfd, &g_draw_cfg, &r, true,
+                                 0x00, 0x00, 0x00, 0xFF);
+            since = 0;
+        }
+        if (x == sx1 && y == sy1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x += sx; }
+        if (e2 <= dx) { err += dx; y += sy; }
+        ++since;
+    }
+
+    int minx = std::min(sx0, sx1) - radius;
+    int miny = std::min(sy0, sy1) - radius;
+    int maxx = std::max(sx0, sx1) + radius;
+    int maxy = std::max(sy0, sy1) + radius;
+    clampi(minx, 0, g_screen_w); clampi(maxx, 0, g_screen_w);
+    clampi(miny, 0, g_screen_h); clampi(maxy, 0, g_screen_h);
+    bbox.x = minx; bbox.y = miny;
+    bbox.w = maxx - minx; bbox.h = maxy - miny;
+
+    if (bbox.w > 0 && bbox.h > 0) {
+        fbink_refresh(g_fbfd, (uint32_t)bbox.y, (uint32_t)bbox.x,
+                      (uint32_t)bbox.w, (uint32_t)bbox.h, &g_rfx_cfg);
+    }
     return bbox;
 }
 
 void inkfb_settle(InkRect r) {
-    send_update(r, WAVEFORM_GC16);
+    if (!g_ok || r.w <= 0 || r.h <= 0) return;
+    // High-quality GC16 pass so the DU ink settles to clean grey.
+    FBInkConfig gc = g_rfx_cfg;
+    gc.wfm_mode = WFM_GC16;
+    fbink_refresh(g_fbfd, (uint32_t)r.y, (uint32_t)r.x,
+                  (uint32_t)r.w, (uint32_t)r.h, &gc);
 }
 
 void inkfb_close() {
-    if (g_fb.mem) { munmap(g_fb.mem, g_fb.mem_len); g_fb.mem = nullptr; }
-    if (g_fb.fd >= 0) { ::close(g_fb.fd); g_fb.fd = -1; }
-    g_fb.ok = false;
+    if (g_fbfd >= 0) { fbink_close(g_fbfd); g_fbfd = -1; }
+    g_ok = false;
 }
 
 } // namespace bn
+
+#endif // BN_HAVE_FBINK

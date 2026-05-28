@@ -12,6 +12,10 @@ cairo      = dependency('cairo')
 tesseract  = dependency('tesseract', required: false, static: true)
 lept       = dependency('lept',      required: false, static: true)
 
+# FBInk: device-correct e-ink fast refresh (Scribe = MTK). Optional — inkfb
+# compiles to a no-op stub when absent, so host builds still work.
+fbink      = dependency('fbink', required: false, static: true)
+
 # Cairo on the stock Kindle sysroot ships 1.16+ headers but an older
 # libcairo.so that's missing cairo_tag_begin/end. Link-probe the symbol
 # so pdf_export.cpp can fall back when the runtime lib lacks them.
@@ -50,6 +54,10 @@ if tesseract.found() and lept.found()
 endif
 if has_cairo_tag
   cpp_args += ['-DBN_HAVE_CAIRO_TAG=1']
+endif
+if fbink.found()
+  deps += [fbink]
+  cpp_args += ['-DBN_HAVE_FBINK=1']
 endif
 
 executable('betternotes',

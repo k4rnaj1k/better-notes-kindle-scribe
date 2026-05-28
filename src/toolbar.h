@@ -23,6 +23,7 @@ enum class ToolbarAction {
     Back,
     Browser,
     Undo,   // only meaningful in Markdown screen for now
+    Exit,   // quit the app
 };
 
 struct ToolbarButton {
