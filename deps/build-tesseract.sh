@@ -73,8 +73,12 @@ sudo find "$PREFIX/lib" -maxdepth 1 \
   -exec chown "$(id -u):$(id -g)" {} +
 
 # ---- english traineddata --------------------------------------------------
+# Use tessdata_best (full-accuracy LSTM) rather than tessdata_fast: the input
+# here is handwriting drawn in the OCR box, where the extra accuracy matters far
+# more than the speed difference on a single short word. Drop a custom
+# handwriting-trained eng.traineddata into the on-device data/ dir to override.
 mkdir -p "$DATA_PREFIX/share/tessdata"
 if [ ! -f "$DATA_PREFIX/share/tessdata/eng.traineddata" ]; then
   curl -fsSL -o "$DATA_PREFIX/share/tessdata/eng.traineddata" \
-    "https://github.com/tesseract-ocr/tessdata_fast/raw/${TESSDATA_VER}/eng.traineddata"
+    "https://github.com/tesseract-ocr/tessdata_best/raw/${TESSDATA_VER}/eng.traineddata"
 fi

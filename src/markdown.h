@@ -31,10 +31,13 @@ double render_markdown(cairo_t *cr, double x, double y0,
                        std::vector<MdLineBox> *out_lines = nullptr);
 
 // Pretty (read-oriented) renderer: formats **bold**, *italic*, `code`,
-// headings, lists, blockquotes and rules with Pango markup. No cursor/tap
-// mapping — used for the non-editing "preview" view. Returns the bottom y.
+// headings, lists, blockquotes and rules with Pango markup, and renders
+// ![alt](path) images (PNG, resolved relative to base_dir) scaled to fit the
+// column. No cursor/tap mapping — used for the non-editing "preview" view.
+// Returns the bottom y.
 double render_markdown_pretty(cairo_t *cr, double x, double y0,
-                             double width, const std::string &src);
+                             double width, const std::string &src,
+                             const std::string &base_dir = "");
 
 // Map a drawing-space tap to a byte offset in src using the line map.
 size_t markdown_offset_at(cairo_t *cr, const std::string &src,

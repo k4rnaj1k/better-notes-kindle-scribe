@@ -1,6 +1,7 @@
 #include "markdown.h"
 
 #include <pango/pangocairo.h>
+#include <map>
 #include <sstream>
 
 namespace bn {
@@ -18,6 +19,16 @@ const char *kFontCode    = "Monospace 17";
 bool starts_with(const std::string &s, const char *p) {
     size_t n = 0; while (p[n]) ++n;
     return s.size() >= n && s.compare(0, n, p) == 0;
+}
+
+// True for an ordered-list item: one or more digits, then ". " or ") ".
+// (Without this, "1. a"/"2. b" lines fall into the paragraph branch and get
+// joined with spaces, dropping the line breaks.)
+bool is_ordered_item(const std::string &line) {
+    size_t i = 0;
+    while (i < line.size() && line[i] >= '0' && line[i] <= '9') ++i;
+    return i > 0 && i + 1 < line.size() &&
+           (line[i] == '.' || line[i] == ')') && line[i + 1] == ' ';
 }
 
 // Pick a font for a source line. We render the RAW line bytes (no markup
@@ -193,16 +204,75 @@ double layout_markup(cairo_t *cr, double x, double y, double width,
     return y + th / (double)PANGO_SCALE + 4;
 }
 
+// PNG surfaces loaded for ![](...) images, keyed by resolved absolute path.
+// Held for the process lifetime (a note references a handful of images), so the
+// per-frame pretty render never re-hits disk. nullptr is cached too, so a
+// missing/non-PNG file isn't retried every frame.
+std::map<std::string, cairo_surface_t *> g_img_cache;
+
+cairo_surface_t *load_image(const std::string &path) {
+    auto it = g_img_cache.find(path);
+    if (it != g_img_cache.end()) return it->second;
+    cairo_surface_t *s = cairo_image_surface_create_from_png(path.c_str());
+    if (s && cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(s);
+        s = nullptr;
+    }
+    g_img_cache.emplace(path, s);
+    return s;
+}
+
+// Render a standalone ![alt](path) image line. Loads the PNG (resolved relative
+// to base_dir) and scales it down to fit the column width; shows an italic
+// placeholder when it can't be loaded. Returns the new y, or -1 if `line` is
+// not a valid image link (so the caller treats it as text).
+double render_image_line(cairo_t *cr, double x, double y, double width,
+                         const std::string &line, const std::string &base_dir) {
+    size_t a = line.find_first_not_of(" \t");
+    if (a == std::string::npos || line.compare(a, 2, "![") != 0) return -1;
+    size_t mid = line.find("](", a);
+    if (mid == std::string::npos) return -1;
+    size_t end = line.find(')', mid + 2);
+    if (end == std::string::npos) return -1;
+    std::string alt  = line.substr(a + 2, mid - (a + 2));
+    std::string path = line.substr(mid + 2, end - (mid + 2));
+
+    std::string resolved = path;
+    if (!path.empty() && path[0] != '/' && !base_dir.empty())
+        resolved = base_dir + "/" + path;
+
+    cairo_surface_t *img = resolved.empty() ? nullptr : load_image(resolved);
+    if (!img) {
+        std::string ph = "[image: " + (alt.empty() ? path : alt) + "]";
+        return layout_markup(cr, x, y, width,
+                             "<i>" + inline_pango(ph) + "</i>", kFontBody);
+    }
+    int iw = cairo_image_surface_get_width(img);
+    int ih = cairo_image_surface_get_height(img);
+    if (iw <= 0 || ih <= 0) return y;
+    double scale = (iw > width) ? width / (double)iw : 1.0;
+    double dh = ih * scale;
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+    cairo_scale(cr, scale, scale);
+    cairo_set_source_surface(cr, img, 0, 0);
+    cairo_paint(cr);
+    cairo_restore(cr);
+    return y + dh + 8.0;
+}
+
 } // namespace
 
 double render_markdown_pretty(cairo_t *cr, double x, double y0,
-                             double width, const std::string &src) {
+                             double width, const std::string &src,
+                             const std::string &base_dir) {
     double y = y0;
     std::istringstream iss(src);
     std::string line;
 
     bool in_code = false;
     std::string code_buf, para_buf;
+    int ordered_counter = 0;   // running number for the current ordered list
 
     auto flush_para = [&]() {
         if (para_buf.empty()) return;
@@ -228,10 +298,30 @@ double render_markdown_pretty(cairo_t *cr, double x, double y0,
         if (line.size() >= 3 && line.compare(0, 3, "```") == 0) {
             if (in_code) flush_code();
             else { flush_para(); in_code = true; }
+            ordered_counter = 0;
             continue;
         }
         if (in_code) { code_buf += line + "\n"; continue; }
         if (line.empty()) { flush_para(); y += 6; continue; }
+
+        // Standalone image: ![alt](path). Flush any pending paragraph above it
+        // first so it lands at the right y.
+        {
+            size_t a = line.find_first_not_of(" \t");
+            if (a != std::string::npos && line.compare(a, 2, "![") == 0 &&
+                line.find("](", a) != std::string::npos) {
+                flush_para();
+                double iy = render_image_line(cr, x, y, width, line, base_dir);
+                if (iy >= 0) { y = iy; ordered_counter = 0; continue; }
+            }
+        }
+
+        // Ordered-list numbering: items renumber sequentially (1, 2, 3…)
+        // regardless of the digits typed. A blank line is handled above and
+        // never reaches here, so it keeps the list going; any other block type
+        // falls through here and resets the count.
+        bool ordered = is_ordered_item(line);
+        if (ordered) ++ordered_counter; else ordered_counter = 0;
 
         if (starts_with(line, "### ")) {
             flush_para();
@@ -250,6 +340,15 @@ double render_markdown_pretty(cairo_t *cr, double x, double y0,
             y = layout_markup(cr, x + 18, y, width - 18,
                               "\xe2\x80\xa2  " + inline_pango(line.substr(2)),
                               kFontBody);
+        } else if (ordered) {
+            // Renumber sequentially, dropping whatever digits the user typed.
+            flush_para();
+            size_t i = 0;
+            while (i < line.size() && line[i] >= '0' && line[i] <= '9') ++i;
+            std::string content = line.substr(i + 2);   // past "N. " / "N) "
+            std::string marker  = std::to_string(ordered_counter) + ".  ";
+            y = layout_markup(cr, x + 18, y, width - 18,
+                              marker + inline_pango(content), kFontBody);
         } else if (line == "---" || line == "***") {
             flush_para();
             cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);

@@ -214,6 +214,47 @@ IndexEntry NotesIndex::create_markdown(const std::string &title) {
     return e;
 }
 
+IndexEntry NotesIndex::create_folder(const std::string &name) {
+    std::string abs = subdir_.empty() ? root_ : root_ + "/" + subdir_;
+    ensure_dir(abs);
+    std::string base = slugify(name);
+    if (base.empty()) base = "folder";
+    std::string id = unique_id(abs, base);
+    std::string dir = abs + "/" + id;
+    ensure_dir(dir);
+    std::string rel = join_rel(subdir_, id);
+    IndexEntry e{rel, id, dir, now_ms(), false, true};
+    entries_.insert(entries_.begin(), e);
+    return e;
+}
+
+bool NotesIndex::move_entry(const std::string &id,
+                            const std::string &dest_dir) {
+    // Resolve the source straight from its vault-relative id rather than the
+    // current listing: the user navigates to the destination folder before
+    // dropping, so the entry is no longer in entries_ by then.
+    if (id.empty()) return false;
+    std::string src_abs = root_ + "/" + id;
+    struct stat st;
+    if (stat(src_abs.c_str(), &st) != 0) return false;   // source gone
+
+    auto slash = id.find_last_of('/');
+    std::string base = (slash == std::string::npos) ? id : id.substr(slash + 1);
+
+    std::string dest_abs = dest_dir.empty() ? root_ : root_ + "/" + dest_dir;
+    std::string newpath  = dest_abs + "/" + base;
+    if (newpath == src_abs) return true;   // already there → no-op
+
+    // Refuse to move a folder into itself or one of its descendants.
+    if (S_ISDIR(st.st_mode) &&
+        (dest_abs == src_abs || dest_abs.rfind(src_abs + "/", 0) == 0))
+        return false;
+
+    ensure_dir(dest_abs);
+    if (path_exists(newpath)) return false;   // refuse to clobber
+    return rename_path(src_abs, newpath);
+}
+
 bool NotesIndex::remove_entry(const std::string &id) {
     for (auto &e : entries_) {
         if (e.id == id) {
@@ -229,7 +270,18 @@ bool NotesIndex::rename_entry(const std::string &id,
     if (new_title.empty()) return false;
     for (auto &e : entries_) {
         if (e.id != id) continue;
-        if (e.is_folder) return false;
+        if (e.is_folder) {
+            // Rename the directory on disk (slugified, like note/markdown dirs).
+            std::string base = slugify(new_title);
+            if (base.empty()) return false;
+            auto slash = e.path.find_last_of('/');
+            std::string dirpart =
+                (slash == std::string::npos) ? "" : e.path.substr(0, slash);
+            std::string newpath = dirpart.empty() ? base : dirpart + "/" + base;
+            if (newpath == e.path) return true;
+            if (path_exists(newpath)) return false;   // refuse to clobber
+            return rename_path(e.path, newpath);
+        }
         if (e.is_markdown) {
             std::string base = slugify(new_title);
             if (base.empty()) return false;

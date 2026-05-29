@@ -46,6 +46,15 @@ public:
     // Allocate a fresh markdown file inside the current subdir.
     IndexEntry create_markdown(const std::string &title);
 
+    // Create a subfolder inside the current subdir. Returns the new entry (or
+    // an existing one if the folder already existed). Re-open() afterwards.
+    IndexEntry create_folder(const std::string &name);
+
+    // Move the entry with this id into dest_dir (vault-relative, "" = root),
+    // keeping its on-disk basename. Refuses to move a folder into itself or a
+    // descendant, or to clobber an existing name. Re-open() afterwards.
+    bool move_entry(const std::string &id, const std::string &dest_dir);
+
     // Refresh updated_ms / title for one note after save.
     void touch(const std::string &id, const std::string &title);
 

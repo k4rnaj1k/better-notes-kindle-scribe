@@ -11,6 +11,12 @@ const char *ROW2[] = {"q","w","e","r","t","y","u","i","o","p"};
 const char *ROW3[] = {"a","s","d","f","g","h","j","k","l"};
 const char *ROW4[] = {"z","x","c","v","b","n","m",",",".","?"};
 
+// Symbols layer. ASCII-only so the Kindle's older Pango never drops a glyph.
+const char *SROW1[] = {"1","2","3","4","5","6","7","8","9","0"};
+const char *SROW2[] = {"@","#","$","%","&","*","-","+","=","/"};
+const char *SROW3[] = {"!","?","(",")","[","]","{","}","<",">"};
+const char *SROW4[] = {":",";","'","\"",",",".","_","|","\\","~"};
+
 // Markdown formatting row: label differs from the inserted text. Labels are
 // kept ASCII so the Kindle's older Pango never drops a glyph.
 struct MdKey { const char *label; const char *out; };
@@ -61,10 +67,17 @@ void Keyboard::layout(double w, double h) {
         }
     }
 
-    add_row(ROW1, 10, top_y_ + 4 + kh);
-    add_row(ROW2, 10, top_y_ + 4 + 2 * kh);
-    add_row(ROW3, 9,  top_y_ + 4 + 3 * kh);
-    add_row(ROW4, 10, top_y_ + 4 + 4 * kh);
+    if (mode_ == Mode::Symbols) {
+        add_row(SROW1, 10, top_y_ + 4 + kh);
+        add_row(SROW2, 10, top_y_ + 4 + 2 * kh);
+        add_row(SROW3, 10, top_y_ + 4 + 3 * kh);
+        add_row(SROW4, 10, top_y_ + 4 + 4 * kh);
+    } else {
+        add_row(ROW1, 10, top_y_ + 4 + kh);
+        add_row(ROW2, 10, top_y_ + 4 + 2 * kh);
+        add_row(ROW3, 9,  top_y_ + 4 + 3 * kh);
+        add_row(ROW4, 10, top_y_ + 4 + 4 * kh);
+    }
 
     // Cursor navigation row. Labels are ASCII words so the Kindle's older
     // Pango never drops a glyph; outputs match App's markdown key handler.
@@ -85,17 +98,26 @@ void Keyboard::layout(double w, double h) {
         }
     }
 
-    // Last row: Shift, Space, Backspace, Enter
+    // Last row. A Mode key (?123 ↔ ABC) toggles the symbols layer; Shift is
+    // only meaningful for letters, so it's dropped in symbols mode and Space
+    // grows to fill the gap.
     double y = top_y_ + 4 + 6 * kh;
     double remain = w_ - 2 * margin;
-    Key shift{{margin, y, remain * 0.15, kh - 6}, "Shift", "Shift"};
-    Key space{{margin + remain * 0.18, y, remain * 0.40, kh - 6}, "Space", " "};
-    Key bksp {{margin + remain * 0.60, y, remain * 0.18, kh - 6}, "Bksp", "Backspace"};
-    Key entr {{margin + remain * 0.80, y, remain * 0.20, kh - 6}, "Enter", "Enter"};
-    keys_.push_back(shift);
-    keys_.push_back(space);
-    keys_.push_back(bksp);
-    keys_.push_back(entr);
+    auto frac = [&](double fx, double fw) {
+        return Rect{margin + remain * fx, y, remain * fw, kh - 6};
+    };
+    if (mode_ == Mode::Symbols) {
+        keys_.push_back(Key{frac(0.00, 0.15), "ABC",   "Mode"});
+        keys_.push_back(Key{frac(0.16, 0.46), "Space", " "});
+        keys_.push_back(Key{frac(0.63, 0.17), "Bksp",  "Backspace"});
+        keys_.push_back(Key{frac(0.81, 0.19), "Enter", "Enter"});
+    } else {
+        keys_.push_back(Key{frac(0.00, 0.13), "?123",  "Mode"});
+        keys_.push_back(Key{frac(0.14, 0.13), "Shift", "Shift"});
+        keys_.push_back(Key{frac(0.28, 0.34), "Space", " "});
+        keys_.push_back(Key{frac(0.63, 0.17), "Bksp",  "Backspace"});
+        keys_.push_back(Key{frac(0.81, 0.19), "Enter", "Enter"});
+    }
 }
 
 void Keyboard::draw(cairo_t *cr) {
@@ -139,9 +161,12 @@ void Keyboard::draw(cairo_t *cr) {
 
 bool Keyboard::press(double x, double y) {
     if (!visible_ || y < top_y_) return false;
+    last_key_rect_ = Rect{};
+    last_full_redraw_ = false;
     for (size_t i = 0; i < keys_.size(); ++i) {
         if (keys_[i].r.contains(x, y)) {
             pressed_idx_ = (int)i;
+            last_key_rect_ = keys_[i].r;
             return true;
         }
     }
@@ -150,6 +175,9 @@ bool Keyboard::press(double x, double y) {
 
 bool Keyboard::release(double x, double y) {
     if (!visible_ || pressed_idx_ < 0) return false;
+    // Always un-highlight the key we pressed, even on an off-key release.
+    last_key_rect_    = keys_[pressed_idx_].r;
+    last_full_redraw_ = false;
     if (!keys_[pressed_idx_].r.contains(x, y)) {
         pressed_idx_ = -1;
         return true;
@@ -157,8 +185,13 @@ bool Keyboard::release(double x, double y) {
     const Key &k = keys_[pressed_idx_];
     pressed_idx_ = -1;
 
-    if (k.output == "Shift") {
+    if (k.output == "Mode") {
+        mode_ = (mode_ == Mode::Letters) ? Mode::Symbols : Mode::Letters;
+        shift_ = false;
+        last_full_redraw_ = true;     // every key changed
+    } else if (k.output == "Shift") {
         shift_ = !shift_;
+        last_full_redraw_ = true;     // letter labels flip case
     } else if (k.output == "Backspace" || k.output == "Enter" ||
                k.output == "Left" || k.output == "Right" ||
                k.output == "Up"   || k.output == "Down"  ||
@@ -171,6 +204,7 @@ bool Keyboard::release(double x, double y) {
         if (shift_ && out.size() == 1 && out[0] >= 'a' && out[0] <= 'z') {
             out[0] = (char)(out[0] - 32);
             shift_ = false;
+            last_full_redraw_ = true; // shift was consumed → labels revert
         }
         if (text_cb_) text_cb_(out);
     }

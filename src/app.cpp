@@ -103,6 +103,27 @@ void App::redraw_toolbar() {
     redraw_rect(0, 0, (double)win_w_, toolbar_.full_height());
 }
 
+void App::redraw_kbd_after_press() {
+    Rect r = keyboard_.last_key_rect();
+    if (r.w > 0) redraw_rect(r.x, r.y, r.w, r.h);
+}
+
+void App::redraw_kbd_after_release() {
+    if (keyboard_.last_full_redraw()) {
+        // Shift/Mode changed every label — repaint the whole keyboard band.
+        redraw_rect(0, keyboard_.top_y(),
+                    (double)win_w_, (double)win_h_ - keyboard_.top_y());
+    } else {
+        Rect r = keyboard_.last_key_rect();
+        if (r.w > 0) redraw_rect(r.x, r.y, r.w, r.h);
+    }
+}
+
+void App::redraw_input_card() {
+    Rect c = modal_card_rect();
+    redraw_rect(c.x, c.y, c.w, c.h);
+}
+
 void App::redraw_rect(double x, double y, double w, double h) {
     if (!canvas_) return;
     // Map drawing-space rect → window (X11) rect by applying the same
@@ -194,7 +215,7 @@ int App::run(int argc, char *argv[]) {
     gtk_widget_show_all(window_);
 
     keyboard_.on_text([this](const std::string &t){
-        if (input_open_) { input_buf_ += t; redraw(); return; }
+        if (input_open_) { input_buf_ += t; redraw_input_card(); return; }
         if (screen_ == Screen::Markdown) {
             markdown_insert(t);
             redraw_markdown_body();
@@ -208,7 +229,7 @@ int App::run(int argc, char *argv[]) {
                 commit_input();   // applies rename + redraws
                 return;
             }
-            redraw();
+            redraw_input_card();
             return;
         }
         if (screen_ != Screen::Markdown) return;
@@ -517,6 +538,7 @@ void App::enter_browser() {
     screen_ = Screen::Browser;
     index_.open(notes_dir_, browser_path_);
     browser_.set_current_path(browser_path_);
+    browser_scroll_ = 0.0;
     redraw();
 }
 
@@ -803,10 +825,107 @@ void App::commit_input() {
         close_input();   // hides keyboard + redraws (stays on the note)
         return;
     }
+    if (input_purpose_ == InputPurpose::NewFolder) {
+        std::string name = input_buf_;
+        close_input();
+        if (!name.empty()) index_.create_folder(name);
+        enter_browser();   // rescans the dir + redraws
+        return;
+    }
     std::string id = input_target_id_, name = input_buf_;
     close_input();
     if (!id.empty() && !name.empty()) index_.rename_entry(id, name);
     enter_browser();   // rescans the dir + redraws
+}
+
+void App::open_new_folder() {
+    input_open_      = true;
+    input_purpose_   = InputPurpose::NewFolder;
+    input_title_     = "New folder";
+    input_buf_.clear();
+    input_target_id_.clear();
+    keyboard_.set_visible(true);
+    redraw();
+}
+
+void App::clamp_browser_scroll() {
+    double content = browser_.content_height(index_);
+    double maxs = std::max(0.0, content - (double)win_h_);
+    if (browser_scroll_ < 0.0)  browser_scroll_ = 0.0;
+    if (browser_scroll_ > maxs) browser_scroll_ = maxs;
+}
+
+void App::handle_browser_action(const BrowserHit &h) {
+    switch (h.action) {
+        case BrowserAction::NewNote: {
+            auto e = index_.create_note("Untitled", TemplateId::Blank);
+            enter_note(e.id);
+            break;
+        }
+        case BrowserAction::NewMarkdown: {
+            auto e = index_.create_markdown("untitled");
+            enter_markdown(e.path);
+            break;
+        }
+        case BrowserAction::NewFolder:
+            open_new_folder();
+            break;
+        case BrowserAction::OpenParent:
+            enter_parent_folder();
+            break;
+        case BrowserAction::Open:
+            if (h.entry_index >= 0 &&
+                h.entry_index < (int)index_.entries().size()) {
+                const auto &e = index_.entries()[h.entry_index];
+                if (e.is_folder)        enter_folder(e.id);
+                else if (e.is_markdown) enter_markdown(e.path);
+                else                    enter_note(e.id);
+            }
+            break;
+        case BrowserAction::Rename:
+            if (h.entry_index >= 0 &&
+                h.entry_index < (int)index_.entries().size()) {
+                const auto &e = index_.entries()[h.entry_index];
+                open_rename(e.id, e.title);
+            }
+            break;
+        case BrowserAction::Delete:
+            if (h.entry_index >= 0 &&
+                h.entry_index < (int)index_.entries().size()) {
+                const auto &e = index_.entries()[h.entry_index];
+                confirm_open_      = true;
+                confirm_target_id_ = e.id;
+                confirm_text_      = "Delete \"" + e.title + "\"?";
+                redraw();
+            }
+            break;
+        case BrowserAction::Move:
+            if (h.entry_index >= 0 &&
+                h.entry_index < (int)index_.entries().size()) {
+                const auto &e = index_.entries()[h.entry_index];
+                move_active_ = true;
+                move_id_     = e.id;
+                move_title_  = e.title;
+                redraw();
+            }
+            break;
+        case BrowserAction::MoveHere:
+            if (move_active_) {
+                index_.move_entry(move_id_, browser_path_);
+                move_active_ = false;
+                move_id_.clear();
+                move_title_.clear();
+                enter_browser();   // rescan + redraw
+            }
+            break;
+        case BrowserAction::MoveCancel:
+            move_active_ = false;
+            move_id_.clear();
+            move_title_.clear();
+            redraw();
+            break;
+        default: break;
+    }
 }
 
 void App::close_input() {
@@ -1024,6 +1143,7 @@ void App::open_draw_modal(DrawPurpose purpose) {
     draw_pen_down_     = false;
     draw_erase_active_ = false;
     draw_ink_bbox_     = {0, 0, 0, 0};
+    ocr_preview_.clear();
     status_ = (purpose == DrawPurpose::Ocr) ? "draw a word, then Save"
                                             : "draw, then Save";
     redraw();
@@ -1055,6 +1175,11 @@ void App::handle_draw_sample(const PenSample &s) {
                 redraw_rect(canvas.x, canvas.y, canvas.w, canvas.h);
         } else {
             draw_erase_active_ = false;
+            if (draw_purpose_ == DrawPurpose::Ocr) {
+                ocr_preview_ =
+                    ocr_.recognize(draw_strokes_, (int)canvas.w, (int)canvas.h);
+                redraw_rect(0, 0, (double)win_w_, canvas.y);
+            }
         }
         return;
     }
@@ -1112,6 +1237,15 @@ void App::handle_draw_sample(const PenSample &s) {
         else
             redraw_rect(canvas.x, canvas.y, canvas.w, canvas.h);
         draw_ink_bbox_ = {0, 0, 0, 0};
+
+        // Recognise as you go so the result shows in the bar before Save —
+        // no surprise about what gets inserted. Runs on the main thread, but
+        // the box is small so the pause is brief.
+        if (draw_purpose_ == DrawPurpose::Ocr) {
+            ocr_preview_ =
+                ocr_.recognize(draw_strokes_, (int)canvas.w, (int)canvas.h);
+            redraw_rect(0, 0, (double)win_w_, canvas.y);   // repaint top bar
+        }
     }
 }
 
@@ -1147,8 +1281,11 @@ void App::commit_draw_modal() {
 
     if (draw_purpose_ == DrawPurpose::Ocr) {
         Rect canvas = draw_canvas_rect();
-        std::string word =
-            ocr_.recognize(draw_strokes_, (int)canvas.w, (int)canvas.h);
+        // Prefer the candidate already shown in the bar (what the user saw);
+        // fall back to a fresh recognise if no preview was computed yet.
+        std::string word = !ocr_preview_.empty()
+            ? ocr_preview_
+            : ocr_.recognize(draw_strokes_, (int)canvas.w, (int)canvas.h);
         if (!word.empty()) {
             markdown_snapshot();
             markdown_insert(word);
@@ -1218,8 +1355,15 @@ void App::draw_draw_modal(cairo_t *cr, int win_w, int win_h) {
     PangoFontDescription *fd = pango_font_description_from_string("Sans 16");
     pango_layout_set_font_description(t, fd);
     pango_font_description_free(fd);
-    pango_layout_set_text(t, draw_purpose_ == DrawPurpose::Ocr
-                                 ? "Draw a word → OCR" : "Draw → attachment", -1);
+    std::string hint;
+    if (draw_purpose_ == DrawPurpose::Ocr) {
+        // Show the live recognition so the user sees what Save will insert.
+        hint = ocr_preview_.empty() ? "Draw a word → OCR"
+                                    : "OCR: " + ocr_preview_;
+    } else {
+        hint = "Draw → attachment";
+    }
+    pango_layout_set_text(t, hint.c_str(), -1);
     cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
     cairo_move_to(cr, draw_btn_rect(1).x + draw_btn_rect(1).w + 24, 26);
     pango_cairo_show_layout(cr, t);
@@ -1473,7 +1617,8 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
 
     if (screen_ == Screen::Browser) {
         browser_.layout(win_w, win_h, index_.entries().size());
-        browser_.draw(cr, index_, win_w, win_h);
+        browser_.draw(cr, index_, win_w, win_h, browser_scroll_,
+                      move_active_, move_title_);
         // Rename input modal (with on-screen keyboard) / delete confirm sit
         // on top of the browser.
         if (input_open_) {
@@ -1536,9 +1681,13 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
 
         if (tool_.markdown_pretty) {
             // Read-oriented preview: formatted markdown, no editable caret.
+            // Images resolve relative to the .md file's own directory.
             md_lines_.clear();
+            std::string base = markdown_path_;
+            auto slash = base.find_last_of('/');
+            base = (slash == std::string::npos) ? "." : base.substr(0, slash);
             double y = render_markdown_pretty(cr, 24, top - markdown_scroll_,
-                                              win_w - 48, markdown_buf_);
+                                              win_w - 48, markdown_buf_, base);
             markdown_content_h_ = (y + markdown_scroll_) - top;
         } else {
             double y = render_markdown(cr, 24, top - markdown_scroll_,
@@ -1803,8 +1952,7 @@ bool App::on_button_press(double x, double y) {
     if (input_open_ && screen_ != Screen::Browser) {
         if (keyboard_.visible() && y >= keyboard_.top_y()) {
             keyboard_.press(x, y);
-            redraw_rect(0, keyboard_.top_y(),
-                        (double)win_w_, (double)win_h_ - keyboard_.top_y());
+            redraw_kbd_after_press();
         }
         return true;
     }
@@ -1820,51 +1968,14 @@ bool App::on_button_press(double x, double y) {
         if (input_open_) {
             if (keyboard_.visible() && y >= keyboard_.top_y()) {
                 keyboard_.press(x, y);
-                redraw_rect(0, keyboard_.top_y(),
-                            (double)win_w_, (double)win_h_ - keyboard_.top_y());
+                redraw_kbd_after_press();
             }
             return true;
         }
-        BrowserHit h = browser_.hit(x, y, index_);
-        switch (h.action) {
-            case BrowserAction::NewNote: {
-                auto e = index_.create_note("Untitled", TemplateId::Blank);
-                enter_note(e.id);
-                break;
-            }
-            case BrowserAction::NewMarkdown: {
-                auto e = index_.create_markdown("untitled");
-                enter_markdown(e.path);
-                break;
-            }
-            case BrowserAction::OpenParent:
-                enter_parent_folder();
-                break;
-            case BrowserAction::Open:
-                if (h.entry_index >= 0) {
-                    const auto &e = index_.entries()[h.entry_index];
-                    if (e.is_folder)        enter_folder(e.id);
-                    else if (e.is_markdown) enter_markdown(e.path);
-                    else                    enter_note(e.id);
-                }
-                break;
-            case BrowserAction::Rename:
-                if (h.entry_index >= 0) {
-                    const auto &e = index_.entries()[h.entry_index];
-                    open_rename(e.id, e.title);
-                }
-                break;
-            case BrowserAction::Delete:
-                if (h.entry_index >= 0) {
-                    const auto &e = index_.entries()[h.entry_index];
-                    confirm_open_      = true;
-                    confirm_target_id_ = e.id;
-                    confirm_text_      = "Delete \"" + e.title + "\"?";
-                    redraw();
-                }
-                break;
-            default: break;
-        }
+        // Tap vs. drag-scroll is resolved on release.
+        swipe_active_ = true;
+        swipe_x0_ = x; swipe_y0_ = y;
+        browser_scroll_at_press_ = browser_scroll_;
         return true;
     }
 
@@ -1890,10 +2001,9 @@ bool App::on_button_press(double x, double y) {
     }
     if (keyboard_.visible() && y >= keyboard_.top_y()) {
         keyboard_.press(x, y);
-        // Key-press feedback only repaints the on-screen keyboard, not the
-        // whole markdown body above it.
-        redraw_rect(0, keyboard_.top_y(),
-                    (double)win_w_, (double)win_h_ - keyboard_.top_y());
+        // Press feedback repaints only the tapped key, not the whole keyboard
+        // band (which flashed the whole on-screen keyboard on every tap).
+        redraw_kbd_after_press();
         return true;
     }
 
@@ -1927,6 +2037,7 @@ bool App::on_button_release(double x, double y) {
             draw_strokes_.clear();
             draw_live_ = Stroke{};
             draw_pen_down_ = false;
+            ocr_preview_.clear();
             redraw();
         } else if (draw_btn_rect(2).contains(x, y)) {     // Cancel
             close_draw_modal();
@@ -1941,7 +2052,7 @@ bool App::on_button_release(double x, double y) {
     if (input_open_ && screen_ != Screen::Browser) {
         if (keyboard_.visible() && y >= keyboard_.top_y()) {
             keyboard_.release(x, y);   // dispatches via on_text/on_key
-            redraw();
+            redraw_kbd_after_release();
             return true;
         }
         if (input_purpose_ == InputPurpose::Tags &&
@@ -1973,13 +2084,27 @@ bool App::on_button_release(double x, double y) {
         if (input_open_) {
             if (keyboard_.visible() && y >= keyboard_.top_y()) {
                 keyboard_.release(x, y);   // dispatches via on_text/on_key
-                redraw();
+                redraw_kbd_after_release();
                 return true;
             }
             if (modal_btn_rect(true).contains(x, y))       commit_input();  // Save
             else if (modal_btn_rect(false).contains(x, y)) close_input();   // Cancel
             return true;
         }
+        // Resolve the browser gesture: a vertical drag scrolls the grid, a tap
+        // dispatches the tile/header action under the finger.
+        if (!swipe_active_) return true;
+        swipe_active_ = false;
+        double dx = x - swipe_x0_, dy = y - swipe_y0_;
+        const double DRAG_MIN = 24.0;
+        if (std::fabs(dy) > DRAG_MIN && std::fabs(dy) >= std::fabs(dx)) {
+            browser_scroll_ = browser_scroll_at_press_ - dy;
+            clamp_browser_scroll();
+            redraw();
+            return true;
+        }
+        BrowserHit h = browser_.hit(x, y, index_, browser_scroll_, move_active_);
+        handle_browser_action(h);
         return true;
     }
 
@@ -2167,11 +2292,10 @@ bool App::on_button_release(double x, double y) {
     if (keyboard_.visible() && y >= keyboard_.top_y()) {
         // The dispatched key edits the buffer and repaints the text band via
         // the on_text/on_key callbacks; here we only need to un-highlight the
-        // released key, so repaint just the keyboard strip (not the whole
-        // screen). The old full redraw() was the keyboard input lag.
+        // released key, so repaint just that key (Shift/Mode repaint the whole
+        // band). The old full-band repaint flashed the keyboard on every tap.
         keyboard_.release(x, y);
-        redraw_rect(0, keyboard_.top_y(),
-                    (double)win_w_, (double)win_h_ - keyboard_.top_y());
+        redraw_kbd_after_release();
         return true;
     }
     return true;

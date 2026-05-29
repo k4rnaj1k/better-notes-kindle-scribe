@@ -90,6 +90,11 @@ private:
     void enter_note(const std::string &id);
     void enter_markdown(const std::string &path);
 
+    // --- browser interactions ---
+    void handle_browser_action(const BrowserHit &h);
+    void open_new_folder();          // input modal for a new subfolder name
+    void clamp_browser_scroll();
+
     // --- note ops ---
     void save_current();
     void export_current_pdf();
@@ -97,7 +102,7 @@ private:
 
     // Browser rename / tags input modal. The on-screen keyboard edits
     // input_buf_; commit_input() dispatches on input_purpose_.
-    enum class InputPurpose { Rename, Tags };
+    enum class InputPurpose { Rename, Tags, NewFolder };
     void open_rename(const std::string &id, const std::string &cur_title);
     void commit_input();   // apply the rename/tags, close the modal
     void close_input();    // dismiss without applying
@@ -136,6 +141,11 @@ private:
     void redraw();
     void redraw_rect(double x, double y, double w, double h);
     void redraw_toolbar();   // fast partial repaint of the toolbar strip
+    // Keyboard feedback: repaint only the key that changed so taps don't flash
+    // the whole on-screen keyboard (full band only on Shift/Mode switches).
+    void redraw_kbd_after_press();
+    void redraw_kbd_after_release();
+    void redraw_input_card();   // repaint just the rename/tags modal card
 
     // Software rotation. The Kindle's X server doesn't support XRandR, so
     // we pre-rotate the cairo context and inverse-rotate input events.
@@ -169,6 +179,15 @@ private:
 
     NotesIndex    index_;
     std::string   browser_path_;     // vault-relative dir the browser is showing
+    // Grid scroll offset (px) and the value captured at gesture start so a
+    // finger drag scrolls relative to where it began.
+    double        browser_scroll_   = 0.0;
+    double        browser_scroll_at_press_ = 0.0;
+    // Move-in-flight: set while the user is relocating an entry. They browse to
+    // a destination folder and tap "Move here".
+    bool          move_active_      = false;
+    std::string   move_id_;          // entry id being moved
+    std::string   move_title_;       // its display title (for the banner)
     Note          note_;             // currently-open note
     int           current_page_ = 0;
     std::string   markdown_path_;
@@ -241,6 +260,9 @@ private:
     double        draw_erase_px_  = 0;
     double        draw_erase_py_  = 0;
     InkRect       draw_ink_bbox_  = {0, 0, 0, 0};
+    // Live OCR candidate shown in the draw modal so the recognised text isn't
+    // a surprise on Save. Recomputed after each stroke; "" until then.
+    std::string   ocr_preview_;
 
     // Template picker modal.
     bool          tmpl_open_      = false;
