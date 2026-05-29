@@ -2,6 +2,7 @@
 
 #include "canvas.h"
 #include "inkfb.h"
+#include "json.h"
 #include "markdown.h"
 #include "note_io.h"
 #include "pages.h"
@@ -24,10 +25,19 @@ namespace {
 constexpr double TOUCH_PRESSURE_THRESHOLD = 1.0;
 
 // GTK signal trampolines (file-static)
-gboolean cb_expose(GtkWidget *w, GdkEventExpose *, gpointer self) {
+gboolean cb_expose(GtkWidget *w, GdkEventExpose *e, gpointer self) {
     int win_w = w->allocation.width;
     int win_h = w->allocation.height;
     cairo_t *cr = gdk_cairo_create(w->window);
+    // Clip to the exposed rectangle. gdk_cairo_create gives an unclipped
+    // context, so without this on_draw rasterises the WHOLE window on every
+    // partial redraw — re-rendering all page strokes even though X only pushes
+    // the dirty rect to e-ink. Clipping lets cairo skip everything outside the
+    // dirty region and lets canvas_render_page cull off-screen strokes.
+    if (e && e->area.width > 0 && e->area.height > 0) {
+        cairo_rectangle(cr, e->area.x, e->area.y, e->area.width, e->area.height);
+        cairo_clip(cr);
+    }
     static_cast<App *>(self)->on_draw(cr, win_w, win_h);
     cairo_destroy(cr);
     return TRUE;
@@ -54,6 +64,71 @@ gboolean cb_process_now(gpointer self) {
     // G_SOURCE_REMOVE / G_SOURCE_CONTINUE landed in GLib 2.32; the Kindle
     // sysroot is older, so use the literal it expands to (FALSE = remove).
     return FALSE;
+}
+
+// File-watch poll interval. e-ink + battery: 3s is responsive enough for a
+// background Syncthing update without churning wake-ups.
+constexpr unsigned kWatchIntervalMs = 3000;
+
+gboolean cb_watch_tick(gpointer self) {
+    static_cast<App *>(self)->on_watch_tick();
+    return TRUE;   // keep the timer running (G_SOURCE_CONTINUE)
+}
+
+// --- Markdown inline title (Obsidian-style) helpers ---
+
+std::string md_basename_no_ext(const std::string &path) {
+    auto slash = path.find_last_of('/');
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (name.size() > 3 && name.compare(name.size() - 3, 3, ".md") == 0)
+        name.resize(name.size() - 3);
+    return name;
+}
+
+// Display title shown as the H1 heading: the filename with '_' → ' '.
+std::string md_title_from_filename(const std::string &basename_no_ext) {
+    std::string out = basename_no_ext;
+    for (auto &c : out) if (c == '_') c = ' ';
+    return out;
+}
+
+// Filename (no extension) derived from the H1 title: trim, ' ' → '_', drop the
+// characters that aren't safe in a filename. Case is preserved (Obsidian-like).
+std::string md_filename_from_title(const std::string &title) {
+    // Trim surrounding whitespace.
+    size_t a = title.find_first_not_of(" \t\r\n");
+    size_t b = title.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    std::string t = title.substr(a, b - a + 1);
+    std::string out;
+    out.reserve(t.size());
+    for (char c : t) {
+        if (c == ' ' || c == '\t') out += '_';
+        else if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                 c == '"' || c == '<' || c == '>' || c == '|' || c == '\0')
+            continue;   // filesystem-unsafe — drop
+        else out += c;
+    }
+    // No leading dot (would hide the file) or trailing separators.
+    while (!out.empty() && (out.front() == '.' )) out.erase(out.begin());
+    while (!out.empty() && (out.back() == '_' || out.back() == '.'))
+        out.pop_back();
+    return out;
+}
+
+// If the buffer's first line is an H1 ("# ..."), return its trimmed text;
+// otherwise "". This is the inline title the filename tracks.
+std::string md_first_heading(const std::string &buf) {
+    size_t nl = buf.find('\n');
+    std::string line = buf.substr(0, nl == std::string::npos ? buf.size() : nl);
+    if (line.size() >= 2 && line[0] == '#' && line[1] == ' ') {
+        std::string t = line.substr(2);
+        size_t a = t.find_first_not_of(" \t\r");
+        size_t b = t.find_last_not_of(" \t\r");
+        if (a == std::string::npos) return "";
+        return t.substr(a, b - a + 1);
+    }
+    return "";
 }
 
 } // namespace
@@ -101,6 +176,91 @@ void App::redraw_toolbar() {
     // the full laid-out toolbar height so toggling visibility cleanly
     // repaints the whole strip (toolbar ↔ revealed page content).
     redraw_rect(0, 0, (double)win_w_, toolbar_.full_height());
+}
+
+void App::redraw_pen_menu_region() {
+    // Repaint the toolbar strip plus only the dropdown panel beneath it. The
+    // page beside the narrow panel is untouched, so opening/closing the pen
+    // menu doesn't re-render all strokes or fire a full-width e-ink refresh.
+    redraw_rect(0, 0, (double)win_w_, toolbar_.full_height());
+    Rect p = toolbar_.pen_menu_panel_rect();
+    if (p.w > 0 && p.h > 0) redraw_rect(p.x, p.y, p.w, p.h);
+}
+
+cairo_surface_t *App::page_surface(int page) {
+    if (page < 0 || page >= (int)note_.pages.size()) return nullptr;
+    if (win_w_ <= 0 || win_h_ <= 0) return nullptr;
+
+    // Reset the whole cache if the note or drawing geometry changed (bitmaps
+    // are sized to win_w_ x win_h_ and indexed within one note).
+    if (page_cache_note_ != note_.id ||
+        page_cache_w_ != win_w_ || page_cache_h_ != win_h_) {
+        clear_page_cache();
+        page_cache_note_ = note_.id;
+        page_cache_w_ = win_w_;
+        page_cache_h_ = win_h_;
+    }
+
+    for (size_t i = 0; i < page_cache_.size(); ++i) {
+        if (page_cache_[i].page == page) {
+            if (i != 0)   // promote to most-recently-used
+                std::rotate(page_cache_.begin(), page_cache_.begin() + i,
+                            page_cache_.begin() + i + 1);
+            return page_cache_.front().surf;
+        }
+    }
+
+    cairo_surface_t *s =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, win_w_, win_h_);
+    if (!s) return nullptr;
+    if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(s);
+        return nullptr;
+    }
+    cairo_t *ic = cairo_create(s);
+    // Match the on-screen ink exactly (hard-edged, like the inkfb / live
+    // preview) so a cached page never looks different from a freshly-drawn one.
+    cairo_set_antialias(ic, CAIRO_ANTIALIAS_NONE);
+    canvas_render_page(ic, note_.pages[page], (double)win_w_, (double)win_h_);
+    cairo_destroy(ic);
+
+    page_cache_.insert(page_cache_.begin(), PageCache{page, s});
+    while ((int)page_cache_.size() > kPageCacheMax) {
+        cairo_surface_destroy(page_cache_.back().surf);
+        page_cache_.pop_back();
+    }
+    return s;
+}
+
+void App::update_page_cache_region(int page, const Rect &r) {
+    if (page < 0 || page >= (int)note_.pages.size()) return;
+    if (r.w <= 0 || r.h <= 0) return;
+    cairo_surface_t *s = nullptr;
+    for (auto &e : page_cache_)
+        if (e.page == page) { s = e.surf; break; }
+    if (!s) return;   // not cached yet — a fresh render will include the change
+    cairo_t *ic = cairo_create(s);
+    cairo_set_antialias(ic, CAIRO_ANTIALIAS_NONE);
+    cairo_rectangle(ic, r.x, r.y, r.w, r.h);
+    cairo_clip(ic);
+    // canvas_render_page repaints the template (clearing the region) then the
+    // strokes culled to the clip, so the cached bitmap mirrors the page again.
+    canvas_render_page(ic, note_.pages[page], (double)win_w_, (double)win_h_);
+    cairo_destroy(ic);
+}
+
+void App::invalidate_page_cache(int page) {
+    for (size_t i = 0; i < page_cache_.size(); ++i)
+        if (page_cache_[i].page == page) {
+            cairo_surface_destroy(page_cache_[i].surf);
+            page_cache_.erase(page_cache_.begin() + i);
+            return;
+        }
+}
+
+void App::clear_page_cache() {
+    for (auto &e : page_cache_) cairo_surface_destroy(e.surf);
+    page_cache_.clear();
 }
 
 void App::redraw_kbd_after_press() {
@@ -183,6 +343,10 @@ int App::run(int argc, char *argv[]) {
         inkfb_init(rotation_);
     }
 
+    // Persisted settings (home folder / export folder / watch toggle) override
+    // the CLI --notes-dir default, so a folder chosen in-app sticks.
+    load_config();
+
     index_.open(notes_dir_);
     canvas_set_vault_root(notes_dir_);   // resolves custom-template bg_image paths
     ocr_.set_tessdata_dir(tessdata_dir_);
@@ -263,10 +427,11 @@ int App::run(int argc, char *argv[]) {
     // directly via g_idle_add when a sample arrives, removing up to ~16 ms
     // of input latency per stroke point.
     enter_browser();
+    if (watch_enabled_) start_file_watch();
     gtk_main();
 
-    if (markdown_dirty_ && !markdown_path_.empty())
-        write_file(markdown_path_, markdown_buf_);
+    stop_file_watch();
+    flush_markdown();
     if (note_.dirty) save_current();
     ocr_.stop();
     pen_.stop();
@@ -315,9 +480,8 @@ void App::process_async_events() {
         // The dropdown is opened by finger (GTK) taps; a stylus touch on the
         // canvas dismisses it so drawing isn't blocked by a stale overlay.
         if (s.down && toolbar_.pen_menu_open()) {
-            double extent = toolbar_.pen_menu_extent();
             toolbar_.close_pen_menu();
-            redraw_rect(0, 0, (double)win_w_, extent);
+            redraw_pen_menu_region();
         }
         // The pen's eraser end is a property of the physical stylus, not the
         // toolbar. Treat a Rubber sample as the eraser tool for THIS sample
@@ -337,11 +501,11 @@ void App::process_async_events() {
         if (eff == Tool::Pen) {
             if (s.down && !pen_down_) {
                 pen_down_ = true;
-                const PenPreset &pp = kPenPresets[tool_.pen_preset];
                 live_stroke_ = Stroke{};
                 live_stroke_.tool     = Tool::Pen;
-                live_stroke_.pen_type = pp.type;
-                live_stroke_.width    = pp.width;
+                live_stroke_.pen_type = tool_.pen_type;
+                live_stroke_.width    =
+                    effective_pen_width(tool_.pen_type, tool_.pen_width_idx);
                 // Calibration aid: dumps the raw device coords and where
                 // they mapped to. Draw a dot in each corner and read these
                 // off the log to derive the exact swap/invert combo.
@@ -369,9 +533,11 @@ void App::process_async_events() {
                 if (!live_stroke_.pts.empty()) {
                     const Point &prev = live_stroke_.pts.back();
                     if (inkfb_available()) {
-                        InkRect r = inkfb_draw_segment(prev.x, prev.y,
-                                                       p.x, p.y,
-                                                       live_stroke_.width);
+                        const PenStyle &ps = pen_style(live_stroke_.pen_type);
+                        double lvl = ps.grey * ps.alpha + (1.0 - ps.alpha);
+                        InkRect r = inkfb_draw_segment(
+                            prev.x, prev.y, p.x, p.y,
+                            pen_live_width(live_stroke_, prev, p), lvl, ps.spray);
                         if (live_ink_bbox_.w == 0) {
                             live_ink_bbox_ = r;
                         } else {
@@ -409,18 +575,21 @@ void App::process_async_events() {
                         std::move(live_stroke_));
                     live_stroke_ = Stroke{};
                     note_.mark_dirty();
+                    // Fold the new stroke into the cached page bitmap so the
+                    // next blit (menu, flip back, partial repaint) shows it.
+                    update_page_cache_region(current_page_,
+                        Rect{bb.x - sw, bb.y - sw, bb.w + 2 * sw, bb.h + 2 * sw});
                     // OCR is no longer a notebook feature — it now lives in the
                     // markdown draw-box (see open_draw_modal/DrawPurpose::Ocr),
                     // so notebooks never trigger background recognition.
                     if (inkfb_available() && live_ink_bbox_.w > 0) {
-                        // inkfb already painted this stroke into the
-                        // framebuffer; a GC16 settle just snaps the A2 ghost to
-                        // clean grey without altering the ink. Deliberately do
-                        // NOT re-render through cairo here — cairo draws a
-                        // subtly different (antialiased, pressure-tapered)
-                        // stroke, which made the ink visibly "snap"/sharpen the
-                        // instant the pen lifted. Leaving the as-drawn pixels
-                        // means nothing changes on pen-up, like the stock app.
+                        // inkfb already painted the final stroke (grey via
+                        // dither, spray via scatter, variable width per
+                        // segment); a fast GC16 settle over just the bbox cleans
+                        // it up. Deliberately NO cairo re-render here — that
+                        // fired a slow whole-bbox X refresh after every stroke,
+                        // which is what made styled pens (esp. spray) feel like
+                        // they "snapped"/lagged on pen-up.
                         inkfb_settle(live_ink_bbox_);
                     } else {
                         // No fast framebuffer path: the live preview was GTK
@@ -446,6 +615,10 @@ void App::process_async_events() {
                                          ex0, ey0, px, py, tool_.eraser_radius);
                 if (d.w > 0 || d.h > 0) {
                     note_.mark_dirty();
+                    // Re-render just the erased footprint into the cached page
+                    // bitmap (cheap, clipped + culled) so the blit below is
+                    // correct without rebuilding the whole page.
+                    update_page_cache_region(current_page_, d);
                     // Repaint ONLY the erased footprint — a full redraw() here
                     // fired a slow whole-screen e-ink refresh on every sample
                     // and dropped frames mid-drag.
@@ -531,14 +704,12 @@ void App::map_pen_to_page(const PenSample &s, double &px, double &py) {
 
 void App::enter_browser() {
     if (note_.dirty) save_current();
-    if (markdown_dirty_ && !markdown_path_.empty()) {
-        write_file(markdown_path_, markdown_buf_);
-        markdown_dirty_ = false;
-    }
+    flush_markdown();
     screen_ = Screen::Browser;
     index_.open(notes_dir_, browser_path_);
     browser_.set_current_path(browser_path_);
     browser_scroll_ = 0.0;
+    browser_sig_ = browser_signature();   // file-watch baseline for this listing
     redraw();
 }
 
@@ -556,6 +727,7 @@ void App::enter_parent_folder() {
 
 void App::enter_note(const std::string &id) {
     if (note_.dirty) save_current();
+    flush_markdown();   // persist + rename a markdown we may be leaving (e.g. Back)
     std::string dir = notes_dir_ + "/" + id;
     Note n;
     if (!load_note(dir, n)) {
@@ -563,6 +735,7 @@ void App::enter_note(const std::string &id) {
         return;
     }
     note_ = std::move(n);
+    clear_page_cache();   // stale bitmaps belong to the previous note
     // Canonicalise: the id stored in-memory is always the vault-relative
     // path, regardless of what was on disk. enter_note(id) below + the
     // save_current path concatenate notes_dir_ + "/" + note_.id, so they
@@ -574,17 +747,52 @@ void App::enter_note(const std::string &id) {
     redraw();
 }
 
+void App::flush_markdown() {
+    if (markdown_path_.empty() || !markdown_dirty_) return;
+    write_file(markdown_path_, markdown_buf_);
+    markdown_dirty_ = false;
+
+    // Obsidian-style: rename the file to track its H1 inline title.
+    std::string title = md_first_heading(markdown_buf_);
+    std::string want  = title.empty() ? "" : md_filename_from_title(title);
+    std::string cur   = md_basename_no_ext(markdown_path_);
+    if (!want.empty() && want != cur) {
+        auto slash = markdown_path_.find_last_of('/');
+        std::string dir = (slash == std::string::npos)
+                              ? "" : markdown_path_.substr(0, slash);
+        std::string newpath = (dir.empty() ? "" : dir + "/") + want + ".md";
+        // Don't clobber an existing file; just keep the old name in that case.
+        if (!path_exists(newpath) && rename_path(markdown_path_, newpath)) {
+            markdown_path_ = newpath;
+            status_ = "renamed → " + want + ".md";
+        }
+    }
+    md_disk_mtime_ = file_mtime_ms(markdown_path_);   // refresh watch baseline
+}
+
+void App::ensure_markdown_title() {
+    // Already starts with an "# ..." line → that's the inline title; leave it.
+    if (!md_first_heading(markdown_buf_).empty()) return;
+    std::string title = md_title_from_filename(md_basename_no_ext(markdown_path_));
+    std::string heading = "# " + title + "\n";
+    if (!markdown_buf_.empty() && markdown_buf_[0] != '\n')
+        heading += "\n";   // blank line between title and existing content
+    markdown_buf_.insert(0, heading);
+    markdown_dirty_ = true;   // persist the added title on the next flush
+}
+
 void App::enter_markdown(const std::string &path) {
-    if (markdown_dirty_ && !markdown_path_.empty())
-        write_file(markdown_path_, markdown_buf_);
+    flush_markdown();   // persist + rename the markdown we're leaving
     markdown_path_ = path;
     markdown_buf_.clear();
     read_file(path, markdown_buf_);
-    markdown_cursor_ = markdown_buf_.size();
     markdown_history_.clear();
     markdown_dirty_ = false;
     markdown_scroll_ = 0.0;
     md_lines_.clear();
+    ensure_markdown_title();   // make sure the inline title heading is present
+    md_disk_mtime_ = file_mtime_ms(path);   // file-watch baseline
+    markdown_cursor_ = markdown_buf_.size();
     screen_ = Screen::Markdown;
     redraw();
 }
@@ -703,7 +911,23 @@ void App::save_current() {
 
 void App::export_current_pdf() {
     if (note_.id.empty()) return;
-    std::string out = notes_dir_ + "/" + note_.id + ".pdf";
+    // Default: write the PDF beside the note inside the vault. If a default
+    // export folder is configured, write a slugified <title>.pdf there instead.
+    // Name the file after the note's current title, not note_.id. note_.id is
+    // the slug fixed at creation time ("untitled" for a never-renamed note), so
+    // a renamed note used to still export as "untitled.pdf".
+    std::string base = slugify(note_.title.empty() ? note_.id : note_.title);
+    std::string out;
+    if (!export_dir_.empty()) {
+        ensure_dir(export_dir_);
+        out = export_dir_ + "/" + base + ".pdf";
+    } else {
+        // Beside the note inside the vault (same parent folder as the note dir).
+        std::string parent = note_.id;
+        auto slash = parent.find_last_of('/');
+        parent = (slash == std::string::npos) ? "" : parent.substr(0, slash);
+        out = notes_dir_ + (parent.empty() ? "" : "/" + parent) + "/" + base + ".pdf";
+    }
     // Strokes are stored in full-screen page-pixel space. Derive the PDF
     // page size from that aspect ratio (uniform scale) so the export isn't
     // squashed — a landscape note exports to a landscape page, a portrait
@@ -727,6 +951,7 @@ void App::export_current_pdf() {
     while (gtk_events_pending()) gtk_main_iteration();
 
     bool ok = export_pdf(out, note_, page_w, page_h, src_w, src_h,
+        note_.title.empty() ? note_.id : note_.title,
         [this](int done, int total) {
             export_done_  = done;
             export_total_ = std::max(1, total);
@@ -823,6 +1048,21 @@ void App::commit_input() {
     if (input_purpose_ == InputPurpose::Tags) {
         commit_tags();
         close_input();   // hides keyboard + redraws (stays on the note)
+        return;
+    }
+    if (input_purpose_ == InputPurpose::HomeFolder) {
+        std::string p = input_buf_;
+        close_input();          // hides keyboard; settings modal stays open
+        set_home_folder(p);     // re-roots the vault + saves config
+        redraw();               // repaint the (re-rooted) browser + settings
+        return;
+    }
+    if (input_purpose_ == InputPurpose::ExportFolder) {
+        std::string p = input_buf_;
+        close_input();
+        export_dir_ = p;        // "" is valid → export beside the note
+        save_config();
+        redraw();
         return;
     }
     if (input_purpose_ == InputPurpose::NewFolder) {
@@ -923,6 +1163,9 @@ void App::handle_browser_action(const BrowserHit &h) {
             move_id_.clear();
             move_title_.clear();
             redraw();
+            break;
+        case BrowserAction::Settings:
+            open_settings();
             break;
         default: break;
     }
@@ -1188,11 +1431,11 @@ void App::handle_draw_sample(const PenSample &s) {
         if (!draw_pen_down_) {
             if (!canvas.contains(px, py)) return;   // ignore touches on the bar
             draw_pen_down_ = true;
-            const PenPreset &pp = kPenPresets[tool_.pen_preset];
             draw_live_ = Stroke{};
             draw_live_.tool     = Tool::Pen;
-            draw_live_.pen_type = pp.type;
-            draw_live_.width    = pp.width;
+            draw_live_.pen_type = tool_.pen_type;
+            draw_live_.width    =
+                effective_pen_width(tool_.pen_type, tool_.pen_width_idx);
             draw_ink_bbox_      = {0, 0, 0, 0};
         }
         if (draw_pen_down_) {
@@ -1203,8 +1446,11 @@ void App::handle_draw_sample(const PenSample &s) {
             if (!draw_live_.pts.empty()) {
                 const Point &prev = draw_live_.pts.back();
                 if (inkfb_available()) {
-                    InkRect r = inkfb_draw_segment(prev.x, prev.y, p.x, p.y,
-                                                   draw_live_.width);
+                    const PenStyle &ps = pen_style(draw_live_.pen_type);
+                    double lvl = ps.grey * ps.alpha + (1.0 - ps.alpha);
+                    InkRect r = inkfb_draw_segment(
+                        prev.x, prev.y, p.x, p.y,
+                        pen_live_width(draw_live_, prev, p), lvl, ps.spray);
                     if (draw_ink_bbox_.w == 0) {
                         draw_ink_bbox_ = r;
                     } else {
@@ -1232,6 +1478,9 @@ void App::handle_draw_sample(const PenSample &s) {
             draw_strokes_.push_back(std::move(draw_live_));
             draw_live_ = Stroke{};
         }
+        // inkfb already painted the final stroke; just settle the bbox. No
+        // cairo re-render of the whole canvas on pen-up (it was slow and made
+        // styled pens snap). The cairo version only renders on Save/redraw.
         if (inkfb_available() && draw_ink_bbox_.w > 0)
             inkfb_settle(draw_ink_bbox_);
         else
@@ -1394,6 +1643,9 @@ void App::apply_template(TemplateId tmpl, const std::string &bg_image) {
     if (current_page_ >= 0 && current_page_ < (int)note_.pages.size()) {
         note_.pages[current_page_].tmpl     = tmpl;
         note_.pages[current_page_].bg_image = bg_image;
+        // The background changed under the strokes — drop this page's cached
+        // bitmap so it re-renders with the new template.
+        invalidate_page_cache(current_page_);
     }
     // New pages inherit the most-recently chosen template.
     note_.default_template = tmpl;
@@ -1564,6 +1816,258 @@ void App::draw_template_picker(cairo_t *cr, int win_w, int win_h) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Settings: home folder, default export folder, file-watch toggle. Persisted
+// to a small JSON file OUTSIDE the vault (the vault path is itself a setting).
+// ----------------------------------------------------------------------------
+
+void App::load_config() {
+    if (config_path_.empty()) {
+        const char *e = std::getenv("BN_CONFIG");
+        config_path_ = e ? e : "/mnt/us/betternotes.json";
+    }
+    std::string raw;
+    if (!read_file(config_path_, raw)) return;   // first run: keep defaults
+    json::Value v;
+    if (!json::parse(raw, v) || v.type != json::Type::Object) return;
+    std::string home = v.str("home_folder", "");
+    if (!home.empty()) notes_dir_ = home;
+    export_dir_ = v.str("export_folder", export_dir_);
+    if (auto *w = v.get("watch_files"); w && w->type == json::Type::Bool)
+        watch_enabled_ = w->b;
+}
+
+void App::save_config() const {
+    json::Value o = json::Value::make_obj();
+    o.obj.emplace("home_folder",   json::Value::make_str(notes_dir_));
+    o.obj.emplace("export_folder", json::Value::make_str(export_dir_));
+    o.obj.emplace("watch_files",   json::Value::make_bool(watch_enabled_));
+    write_file(config_path_, json::serialize(o));
+}
+
+void App::set_home_folder(const std::string &path) {
+    if (path.empty() || path == notes_dir_) return;
+    // Flush outstanding work into the OLD vault before re-rooting.
+    if (note_.dirty) save_current();
+    flush_markdown();
+    notes_dir_ = path;
+    ensure_dir(notes_dir_);
+    // Drop open-document state so nothing saves back into the old vault.
+    note_ = Note{};
+    clear_page_cache();
+    markdown_path_.clear();
+    markdown_buf_.clear();
+    markdown_dirty_ = false;
+    browser_path_.clear();
+    browser_scroll_ = 0.0;
+    canvas_set_vault_root(notes_dir_);
+    index_.open(notes_dir_, "");
+    browser_.set_current_path("");
+    browser_sig_ = browser_signature();
+    save_config();
+    status_ = "home → " + notes_dir_;
+}
+
+Rect App::settings_card_rect() const {
+    double cw = std::min(700.0, (double)win_w_ * 0.9);
+    double ch = 470.0;
+    double cx = ((double)win_w_ - cw) / 2.0;
+    double cy = 150.0;
+    return Rect{cx, cy, cw, ch};
+}
+
+Rect App::settings_row_btn_rect(int row) const {
+    Rect c = settings_card_rect();
+    const double rh = 96.0, bw = 170.0, bh = 64.0;
+    double top = c.y + 96.0 + row * rh;
+    return Rect{c.x + c.w - 24.0 - bw, top + (rh - bh) / 2.0 - 10.0, bw, bh};
+}
+
+Rect App::settings_close_btn_rect() const {
+    Rect c = settings_card_rect();
+    double bw = 170.0, bh = 64.0;
+    return Rect{c.x + c.w - 24.0 - bw, c.y + c.h - 24.0 - bh, bw, bh};
+}
+
+void App::open_settings() {
+    settings_open_ = true;
+    status_ = "settings";
+    redraw();
+}
+
+void App::close_settings() {
+    settings_open_ = false;
+    redraw();
+}
+
+void App::draw_settings_modal(cairo_t *cr, int win_w, int win_h) {
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
+    cairo_rectangle(cr, 0, 0, win_w, win_h); cairo_fill(cr);
+
+    Rect c = settings_card_rect();
+    cairo_set_source_rgb(cr, 0.98, 0.98, 0.98);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+    cairo_set_line_width(cr, 2.0);
+    cairo_rectangle(cr, c.x, c.y, c.w, c.h); cairo_stroke(cr);
+
+    // Title.
+    PangoFontDescription *fd = pango_font_description_from_string("Sans Bold 24");
+    PangoLayout *t = pango_cairo_create_layout(cr);
+    pango_layout_set_font_description(t, fd);
+    pango_layout_set_text(t, "Settings", -1);
+    cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+    cairo_move_to(cr, c.x + 24, c.y + 20);
+    pango_cairo_show_layout(cr, t);
+    g_object_unref(t);
+    pango_font_description_free(fd);
+
+    // One row = a label, a value (ellipsized at the start so the tail/path end
+    // stays readable), and a right-aligned action button.
+    auto row = [&](int i, const char *label, const std::string &value,
+                   const char *btn) {
+        const double rh = 96.0;
+        double top = c.y + 96.0 + i * rh;
+        Rect br = settings_row_btn_rect(i);
+
+        PangoLayout *l = pango_cairo_create_layout(cr);
+        PangoFontDescription *lf = pango_font_description_from_string("Sans 18");
+        pango_layout_set_font_description(l, lf);
+        pango_font_description_free(lf);
+        pango_layout_set_text(l, label, -1);
+        cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
+        cairo_move_to(cr, c.x + 24, top + 8);
+        pango_cairo_show_layout(cr, l);
+        g_object_unref(l);
+
+        PangoLayout *vl = pango_cairo_create_layout(cr);
+        PangoFontDescription *vf = pango_font_description_from_string("Sans 15");
+        pango_layout_set_font_description(vl, vf);
+        pango_font_description_free(vf);
+        pango_layout_set_width(vl, (int)((br.x - (c.x + 24) - 16) * PANGO_SCALE));
+        pango_layout_set_ellipsize(vl, PANGO_ELLIPSIZE_START);
+        pango_layout_set_text(vl, value.c_str(), -1);
+        cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
+        cairo_move_to(cr, c.x + 24, top + 44);
+        pango_cairo_show_layout(cr, vl);
+        g_object_unref(vl);
+
+        modal_button(cr, br, btn, false);
+    };
+
+    row(0, "Home folder", notes_dir_, "Edit");
+    row(1, "Export folder",
+        export_dir_.empty() ? "(default: beside note)" : export_dir_, "Edit");
+    row(2, "Watch files (Syncthing)",
+        watch_enabled_ ? "reloads on external change" : "off",
+        watch_enabled_ ? "On" : "Off");
+
+    modal_button(cr, settings_close_btn_rect(), "Close", true);
+}
+
+void App::handle_settings_release(double x, double y) {
+    if (settings_close_btn_rect().contains(x, y)) { close_settings(); return; }
+
+    if (settings_row_btn_rect(0).contains(x, y)) {        // edit home folder
+        input_open_      = true;
+        input_purpose_   = InputPurpose::HomeFolder;
+        input_title_     = "Home folder (full path)";
+        input_buf_       = notes_dir_;
+        input_target_id_.clear();
+        keyboard_.set_visible(true);
+        redraw();
+        return;
+    }
+    if (settings_row_btn_rect(1).contains(x, y)) {        // edit export folder
+        input_open_      = true;
+        input_purpose_   = InputPurpose::ExportFolder;
+        input_title_     = "Export folder (blank = beside note)";
+        input_buf_       = export_dir_;
+        input_target_id_.clear();
+        keyboard_.set_visible(true);
+        redraw();
+        return;
+    }
+    if (settings_row_btn_rect(2).contains(x, y)) {        // toggle file-watch
+        watch_enabled_ = !watch_enabled_;
+        if (watch_enabled_) start_file_watch(); else stop_file_watch();
+        save_config();
+        redraw();
+        return;
+    }
+    // Tap outside the card closes it.
+    Rect c = settings_card_rect();
+    if (x < c.x || x > c.x + c.w || y < c.y || y > c.y + c.h) close_settings();
+}
+
+// ----------------------------------------------------------------------------
+// File watch (Syncthing): poll the open markdown file / browser listing for
+// external updates so background syncs appear without a restart.
+// ----------------------------------------------------------------------------
+
+void App::start_file_watch() {
+    if (watch_source_) return;
+    watch_source_ = g_timeout_add(kWatchIntervalMs, cb_watch_tick, this);
+}
+
+void App::stop_file_watch() {
+    if (watch_source_) { g_source_remove(watch_source_); watch_source_ = 0; }
+}
+
+std::string App::browser_signature() const {
+    std::string sig;
+    sig.reserve(index_.entries().size() * 24);
+    for (auto &e : index_.entries()) {
+        sig += e.id;
+        sig += ':';
+        sig += std::to_string(e.updated_ms);
+        sig += ';';
+    }
+    return sig;
+}
+
+void App::on_watch_tick() {
+    if (!watch_enabled_) return;
+    // Don't disturb an in-flight export, active drawing, text entry, or an
+    // open settings modal (it would repaint underneath it).
+    if (exporting_pdf_ || pen_down_ || draw_pen_down_ ||
+        input_open_ || settings_open_) return;
+
+    if (screen_ == Screen::Markdown && !markdown_path_.empty()) {
+        uint32_t m = file_mtime_ms(markdown_path_);
+        if (m != 0 && m > md_disk_mtime_) {
+            // External update — overwrite the buffer with the on-disk version.
+            std::string fresh;
+            if (read_file(markdown_path_, fresh)) {
+                markdown_buf_ = std::move(fresh);
+                if (markdown_cursor_ > markdown_buf_.size())
+                    markdown_cursor_ = markdown_buf_.size();
+                markdown_dirty_ = false;
+                md_disk_mtime_  = m;
+                md_lines_.clear();
+                status_ = "reloaded (sync)";
+                redraw_markdown_body();   // partial: text band only
+                redraw_toolbar();         // refresh the status line
+            }
+        }
+        return;
+    }
+
+    if (screen_ == Screen::Browser) {
+        // Re-scan; redraw only if the listing actually changed so a quiet
+        // vault never fires a (slow) full-screen e-ink refresh.
+        index_.open(notes_dir_, browser_path_);
+        std::string sig = browser_signature();
+        if (sig != browser_sig_) {
+            browser_sig_ = sig;
+            redraw();
+        }
+        return;
+    }
+    // NoteView is intentionally not auto-reloaded (multi-file, edit-in-progress
+    // risk); see the settings note.
+}
+
 void App::set_rotation(int deg) {
     deg = ((deg % 360) + 360) % 360;
     if (deg != 0 && deg != 90 && deg != 180 && deg != 270) deg = 0;
@@ -1619,8 +2123,13 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
         browser_.layout(win_w, win_h, index_.entries().size());
         browser_.draw(cr, index_, win_w, win_h, browser_scroll_,
                       move_active_, move_title_);
-        // Rename input modal (with on-screen keyboard) / delete confirm sit
-        // on top of the browser.
+        // Settings modal sits over the browser; editing a path swaps it for the
+        // input modal + keyboard (drawn on top), so show settings only when no
+        // text field is open.
+        if (settings_open_ && !input_open_)
+            draw_settings_modal(cr, win_w, win_h);
+        // Rename / path / delete input modals (with on-screen keyboard) sit on
+        // top of the browser (and settings).
         if (input_open_) {
             keyboard_.layout(win_w, win_h);
             keyboard_.draw(cr);
@@ -1643,8 +2152,23 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
         // own context and keeps AA, so exports stay smooth.) Restored to the
         // default before the rest of the UI so text/icons still antialias.
         cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
-        if (current_page_ < (int)note_.pages.size())
-            canvas_render_page(cr, note_.pages[current_page_], page_w, page_h);
+        if (current_page_ < (int)note_.pages.size()) {
+            // Blit the cached page bitmap (cheap, clipped to the exposed rect)
+            // instead of re-rasterising every stroke. Falls back to a direct
+            // render if the bitmap couldn't be allocated.
+            cairo_surface_t *cached = page_surface(current_page_);
+            if (cached) {
+                cairo_set_source_surface(cr, cached, 0, 0);
+                // NEAREST: the cache is 1:1 with the drawing space, so for the
+                // 90/180/270 rotations this is an exact transpose, no blur.
+                cairo_pattern_set_filter(cairo_get_source(cr),
+                                         CAIRO_FILTER_NEAREST);
+                cairo_paint(cr);
+            } else {
+                canvas_render_page(cr, note_.pages[current_page_],
+                                   page_w, page_h);
+            }
+        }
         if (pen_down_ && tool_.current == Tool::Pen)
             canvas_render_stroke(cr, live_stroke_);
         cairo_set_antialias(cr, CAIRO_ANTIALIAS_DEFAULT);
@@ -1972,6 +2496,8 @@ bool App::on_button_press(double x, double y) {
             }
             return true;
         }
+        // Settings modal acts on release; swallow the press.
+        if (settings_open_) return true;
         // Tap vs. drag-scroll is resolved on release.
         swipe_active_ = true;
         swipe_x0_ = x; swipe_y0_ = y;
@@ -2091,6 +2617,8 @@ bool App::on_button_release(double x, double y) {
             else if (modal_btn_rect(false).contains(x, y)) close_input();   // Cancel
             return true;
         }
+        // Settings modal (no text field open): its buttons act on release.
+        if (settings_open_) { handle_settings_release(x, y); return true; }
         // Resolve the browser gesture: a vertical drag scrolls the grid, a tap
         // dispatches the tile/header action under the finger.
         if (!swipe_active_) return true;
@@ -2173,18 +2701,24 @@ bool App::on_button_release(double x, double y) {
         return true;
     }
 
-    // Pen-preset dropdown is modal-ish: a tap either picks a preset or
-    // dismisses it. Its items hang below the toolbar strip, so this must run
-    // before the y < height() gate.
+    // Pen dropdown is modal-ish. A width chip updates the size and keeps the
+    // menu open (so you can then pick a type with the new width previewed); a
+    // type row selects the pen and closes; a tap elsewhere just dismisses.
+    // Its items hang below the toolbar strip, so this runs before the
+    // y < height() gate.
     if (toolbar_.pen_menu_open()) {
-        int preset = toolbar_.pen_menu_hit(x, y);
-        if (preset >= 0) {
-            tool_.current    = Tool::Pen;
-            tool_.pen_preset = preset;
+        PenMenuHit h = toolbar_.pen_menu_hit(x, y);
+        if (h.kind == PenMenuHit::Kind::Width) {
+            tool_.pen_width_idx = h.index;
+            redraw_pen_menu_region();   // keep open, refresh previews
+            return true;
         }
-        double extent = toolbar_.pen_menu_extent();
+        if (h.kind == PenMenuHit::Kind::Type) {
+            tool_.current  = Tool::Pen;
+            tool_.pen_type = kPenTypeMenu[h.index];
+        }
         toolbar_.close_pen_menu();
-        redraw_rect(0, 0, (double)win_w_, extent);   // clear just the band
+        redraw_pen_menu_region();   // restore page content under the panel
         return true;
     }
 
@@ -2198,10 +2732,11 @@ bool App::on_button_release(double x, double y) {
         switch (a) {
             case ToolbarAction::Pen:
                 tool_.current = Tool::Pen;
-                toolbar_.toggle_pen_menu();   // reveal/hide the preset dropdown
-                // Repaint just the toolbar strip + dropdown band — a full
-                // redraw fires a slow whole-screen e-ink refresh.
-                redraw_rect(0, 0, (double)win_w_, toolbar_.pen_menu_extent());
+                toolbar_.toggle_pen_menu();   // reveal/hide the pen dropdown
+                // Repaint only the toolbar strip + the narrow dropdown panel.
+                // The old full-width band re-rendered every page stroke and
+                // fired a slow whole-width e-ink refresh on each open/close.
+                redraw_pen_menu_region();
                 return true;
             case ToolbarAction::Eraser:    tool_.current = Tool::Eraser; break;
             case ToolbarAction::Lasso:     tool_.current = Tool::Lasso;  break;
@@ -2214,7 +2749,12 @@ bool App::on_button_release(double x, double y) {
                 tool_.ocr_enabled = !tool_.ocr_enabled;
                 ocr_.set_enabled(tool_.ocr_enabled);
                 break;
-            case ToolbarAction::Save:      save_current(); break;
+            case ToolbarAction::Save:
+                // Markdown: persist + apply the inline-title rename. Notes: the
+                // usual note save. (md auto-saves on navigation too.)
+                if (screen_ == Screen::Markdown) flush_markdown();
+                else                             save_current();
+                break;
             case ToolbarAction::ExportPdf: export_current_pdf(); break;
             case ToolbarAction::AddPage:
                 if (screen_ == Screen::NoteView) {
@@ -2276,10 +2816,7 @@ bool App::on_button_release(double x, double y) {
                 // Persist outstanding work before tearing down. The rest of
                 // the shutdown (ocr/pen/inkfb stop) runs in run()'s epilogue
                 // after gtk_main() returns.
-                if (markdown_dirty_ && !markdown_path_.empty()) {
-                    write_file(markdown_path_, markdown_buf_);
-                    markdown_dirty_ = false;
-                }
+                flush_markdown();
                 if (note_.dirty) save_current();
                 gtk_main_quit();
                 return true;

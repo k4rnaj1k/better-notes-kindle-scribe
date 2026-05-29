@@ -19,6 +19,7 @@ enum class BrowserAction {
     Move,          // start moving the entry at entry_index
     MoveHere,      // drop the in-flight move into the current directory
     MoveCancel,    // abort the in-flight move
+    Settings,      // open the app settings modal
 };
 
 struct BrowserHit {

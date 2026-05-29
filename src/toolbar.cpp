@@ -350,23 +350,54 @@ void Toolbar::layout(double width, ToolbarMode mode) {
     }
 }
 
-Rect Toolbar::pen_menu_item_rect(int i) const {
-    double iw = std::max(pen_btn_rect_.w, 320.0);
-    double ih = 96.0;
-    return Rect{pen_btn_rect_.x, height_ + i * ih, iw, ih};
+namespace {
+constexpr double kWidthRowH = 64.0;   // height of the width-chip row
+constexpr double kTypeRowH  = 84.0;   // height of each pen-type row
+} // namespace
+
+double Toolbar::pen_menu_w() const { return std::max(pen_btn_rect_.w, 380.0); }
+
+double Toolbar::pen_menu_x() const {
+    double w = pen_menu_w();
+    double x = pen_btn_rect_.x;
+    if (x + w > width_) x = width_ - w;   // keep the panel on-screen
+    if (x < 0) x = 0;
+    return x;
 }
 
-int Toolbar::pen_menu_hit(double x, double y) const {
-    if (!pen_menu_open_) return -1;
-    for (int i = 0; i < kPenPresetCount; ++i)
-        if (pen_menu_item_rect(i).contains(x, y)) return i;
-    return -1;
+Rect Toolbar::pen_menu_width_rect(int i) const {
+    double w  = pen_menu_w();
+    double cw = w / kPenWidthCount;
+    return Rect{pen_menu_x() + i * cw, height_, cw, kWidthRowH};
+}
+
+Rect Toolbar::pen_menu_type_rect(int i) const {
+    return Rect{pen_menu_x(), height_ + kWidthRowH + i * kTypeRowH,
+                pen_menu_w(), kTypeRowH};
+}
+
+PenMenuHit Toolbar::pen_menu_hit(double x, double y) const {
+    PenMenuHit h;
+    if (!pen_menu_open_) return h;
+    for (int i = 0; i < kPenWidthCount; ++i)
+        if (pen_menu_width_rect(i).contains(x, y)) {
+            h.kind = PenMenuHit::Kind::Width; h.index = i; return h;
+        }
+    for (int i = 0; i < kPenTypeCount; ++i)
+        if (pen_menu_type_rect(i).contains(x, y)) {
+            h.kind = PenMenuHit::Kind::Type; h.index = i; return h;
+        }
+    return h;
 }
 
 double Toolbar::pen_menu_extent() const {
-    if (kPenPresetCount == 0) return height_;
-    Rect last = pen_menu_item_rect(kPenPresetCount - 1);
+    Rect last = pen_menu_type_rect(kPenTypeCount - 1);
     return last.y + last.h;
+}
+
+Rect Toolbar::pen_menu_panel_rect() const {
+    double top = height_;
+    return Rect{pen_menu_x(), top, pen_menu_w(), pen_menu_extent() - top};
 }
 
 void Toolbar::draw(cairo_t *cr, const ToolState &st,
@@ -399,55 +430,150 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
     PangoFontDescription *fd = pango_font_description_from_string("Sans 12");
     pango_layout_set_font_description(layout, fd);
     pango_font_description_free(fd);
-    char buf[128];
-    const char *tool_name = (st.current == Tool::Pen)
-        ? kPenPresets[st.pen_preset].name
-        : tool_label(st.current);
-    std::snprintf(buf, sizeof(buf), "%s   p%d/%d   %s",
-                  tool_name, page + 1, total,
-                  status.c_str());
+    char buf[160];
+    if (st.current == Tool::Pen) {
+        std::snprintf(buf, sizeof(buf), "%s %s   p%d/%d   %s",
+                      pen_display_name(st.pen_type),
+                      kPenWidthNames[st.pen_width_idx], page + 1, total,
+                      status.c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf), "%s   p%d/%d   %s",
+                      tool_label(st.current), page + 1, total,
+                      status.c_str());
+    }
     pango_layout_set_text(layout, buf, -1);
     cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
     cairo_move_to(cr, 12, height_ - 20);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
 
-    // Pen-preset dropdown, drawn last so it overlays the canvas below.
+    // Pen dropdown, drawn last so it overlays the canvas below: a row of width
+    // chips, then one preview row per pen type.
     if (pen_menu_open_) {
-        for (int i = 0; i < kPenPresetCount; ++i) {
-            Rect r = pen_menu_item_rect(i);
-            bool active = (i == st.pen_preset);
+        draw_pen_menu(cr, st);
+    }
+}
 
-            double bg = active ? 0.20 : 0.97;
-            cairo_set_source_rgb(cr, bg, bg, bg);
-            cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr);
-            cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
-            cairo_set_line_width(cr, 1.5);
-            cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_stroke(cr);
+namespace {
 
-            // Width preview: a short stroke rendered at the preset's width.
-            const PenPreset &pp = kPenPresets[i];
-            double cy = r.y + r.h * 0.5;
-            double fg = active ? 0.95 : 0.12;
-            cairo_set_source_rgb(cr, fg, fg, fg);
-            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-            cairo_set_line_width(cr, std::min(pp.width, r.h * 0.4));
-            cairo_move_to(cr, r.x + 22, cy);
-            cairo_line_to(cr, r.x + 78, cy);
-            cairo_stroke(cr);
+// A short representative sample of `type` at `ew` width, centred vertically in
+// `r`, used as the preview swatch in the pen dropdown.
+void draw_pen_sample(cairo_t *cr, PenType type, double ew,
+                     double x0, double x1, double cy, bool active) {
+    const PenStyle &ps = pen_style(type);
+    // On the dark active row, force the swatch light so it stays visible;
+    // otherwise honour the pen's own grey/alpha.
+    double g = active ? std::max(ps.grey, 0.85) : ps.grey;
+    double a = active ? 1.0 : ps.alpha;
+    cairo_set_source_rgba(cr, g, g, g, a);
 
-            PangoLayout *il = pango_cairo_create_layout(cr);
-            PangoFontDescription *ifd =
-                pango_font_description_from_string("Sans 20");
-            pango_layout_set_font_description(il, ifd);
-            pango_font_description_free(ifd);
-            pango_layout_set_text(il, pp.name, -1);
-            int tw, th; pango_layout_get_pixel_size(il, &tw, &th);
-            (void)tw;
-            cairo_move_to(cr, r.x + 96, cy - th / 2.0);
-            pango_cairo_show_layout(cr, il);
-            g_object_unref(il);
+    if (ps.spray) {
+        double band = std::max(2.0, ew * 0.5);
+        for (int k = 0; k < 60; ++k) {
+            double t  = (k * 2654435761u % 1000) / 1000.0;
+            double aa = (k * 40503u % 1000) / 1000.0 * 2 * M_PI;
+            double rr = std::sqrt((k * 22695477u % 1000) / 1000.0) * band;
+            double px = x0 + (x1 - x0) * t + std::cos(aa) * rr;
+            double py = cy + std::sin(aa) * rr;
+            cairo_arc(cr, px, py, 0.8, 0, 2 * M_PI);
+            cairo_fill(cr);
         }
+        return;
+    }
+    cairo_set_line_cap(cr, ps.square_cap ? CAIRO_LINE_CAP_SQUARE
+                                         : CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    if (ps.directional) {
+        // Fountain: taper thin→thick→thin across the swatch.
+        int seg = 16;
+        for (int k = 0; k < seg; ++k) {
+            double t  = (double)k / seg;
+            double w  = ew * (0.25 + 0.75 * std::sin(t * M_PI));
+            cairo_set_line_width(cr, std::max(1.0, w));
+            cairo_move_to(cr, x0 + (x1 - x0) * t, cy);
+            cairo_line_to(cr, x0 + (x1 - x0) * (t + 1.0 / seg), cy);
+            cairo_stroke(cr);
+        }
+        return;
+    }
+    cairo_set_line_width(cr, std::max(1.0, ew));
+    cairo_move_to(cr, x0, cy);
+    cairo_line_to(cr, x1, cy);
+    cairo_stroke(cr);
+    if (ps.grain) {   // pencil graphite specks
+        cairo_set_source_rgba(cr, active ? 0.6 : 0.12,
+                              active ? 0.6 : 0.12, active ? 0.6 : 0.12, 0.6);
+        for (int k = 0; k < 24; ++k) {
+            double px = x0 + (x1 - x0) * ((k * 2654435761u % 1000) / 1000.0);
+            double py = cy + ((int)(k * 40503u % 100) - 50) / 100.0 * ew;
+            cairo_arc(cr, px, py, 0.7, 0, 2 * M_PI);
+            cairo_fill(cr);
+        }
+    }
+}
+
+} // namespace
+
+void Toolbar::draw_pen_menu(cairo_t *cr, const ToolState &st) {
+    // Width chips.
+    for (int i = 0; i < kPenWidthCount; ++i) {
+        Rect r = pen_menu_width_rect(i);
+        bool active = (i == st.pen_width_idx);
+        double bg = active ? 0.20 : 0.97;
+        cairo_set_source_rgb(cr, bg, bg, bg);
+        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr);
+        cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
+        cairo_set_line_width(cr, 1.5);
+        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_stroke(cr);
+
+        // A dot sized to the raw base width, plus the size label.
+        double fg = active ? 0.95 : 0.12;
+        cairo_set_source_rgb(cr, fg, fg, fg);
+        cairo_arc(cr, r.x + r.w / 2.0, r.y + r.h * 0.36,
+                  std::min(kPenWidths[i] * 0.7 + 2.0, r.h * 0.22), 0, 2 * M_PI);
+        cairo_fill(cr);
+
+        PangoLayout *l = pango_cairo_create_layout(cr);
+        PangoFontDescription *fd = pango_font_description_from_string("Sans 14");
+        pango_layout_set_font_description(l, fd);
+        pango_font_description_free(fd);
+        pango_layout_set_text(l, kPenWidthNames[i], -1);
+        int tw, th; pango_layout_get_pixel_size(l, &tw, &th);
+        cairo_move_to(cr, r.x + (r.w - tw) / 2.0, r.y + r.h - th - 6);
+        pango_cairo_show_layout(cr, l);
+        g_object_unref(l);
+    }
+
+    // Pen-type rows.
+    for (int i = 0; i < kPenTypeCount; ++i) {
+        Rect r = pen_menu_type_rect(i);
+        PenType type = kPenTypeMenu[i];
+        bool active = (st.current == Tool::Pen && type == st.pen_type);
+
+        double bg = active ? 0.20 : 0.97;
+        cairo_set_source_rgb(cr, bg, bg, bg);
+        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr);
+        cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
+        cairo_set_line_width(cr, 1.5);
+        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_stroke(cr);
+
+        double cy = r.y + r.h * 0.5;
+        double ew = effective_pen_width(type, st.pen_width_idx);
+        ew = std::min(ew, r.h * 0.5);   // clamp so a wide highlighter still fits
+        draw_pen_sample(cr, type, ew, r.x + 22, r.x + 150, cy, active);
+
+        PangoLayout *il = pango_cairo_create_layout(cr);
+        PangoFontDescription *ifd = pango_font_description_from_string("Sans 20");
+        pango_layout_set_font_description(il, ifd);
+        pango_font_description_free(ifd);
+        pango_layout_set_text(il, pen_display_name(type), -1);
+        int tw, th; pango_layout_get_pixel_size(il, &tw, &th);
+        (void)tw;
+        double fg = active ? 0.95 : 0.12;
+        cairo_set_source_rgb(cr, fg, fg, fg);
+        cairo_move_to(cr, r.x + 170, cy - th / 2.0);
+        pango_cairo_show_layout(cr, il);
+        g_object_unref(il);
     }
 }
 

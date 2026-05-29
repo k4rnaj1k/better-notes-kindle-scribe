@@ -111,4 +111,10 @@ uint32_t now_ms() {
     return (uint32_t)(tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL);
 }
 
+uint32_t file_mtime_ms(const std::string &path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    return (uint32_t)(st.st_mtime * 1000ULL);
+}
+
 } // namespace bn

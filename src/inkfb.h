@@ -31,12 +31,19 @@ bool inkfb_available();
 int  inkfb_screen_w();
 int  inkfb_screen_h();
 
-// Draw a monochrome line segment in *drawing-space* coordinates.
-// Internally we transform to screen-space and rasterise into fb. Returns
-// the screen-space bbox actually touched (so the caller can union them).
+// Draw a line segment in *drawing-space* coordinates. Internally we transform
+// to screen-space and rasterise into fb. Returns the screen-space bbox actually
+// touched (so the caller can union them).
+//
+// `ink_level` is the target ink lightness 0=black .. 1=white. The panel under
+// the DU waveform is 2-level, so grey is approximated by ordered dithering
+// (sparser black pixels). 0 keeps the original solid-black behaviour exactly.
+// `spray` scatters sparse dots within the brush radius instead of a solid disc
+// (the spray-can pen), drawn directly to the framebuffer with no cairo resnap.
 InkRect inkfb_draw_segment(double x0, double y0,
                             double x1, double y1,
-                            double width);
+                            double width, double ink_level = 0.0,
+                            bool spray = false);
 
 // Issue a high-quality (GC16) refresh over the union rect when the pen
 // lifts, so the rough A2 ink "snaps" to clean greyscale. The rect is in

@@ -68,6 +68,9 @@ public:
     // GTK idle callback drains pen_queue_ + ocr_queue_.
     void process_async_events();
 
+    // GTK timer callback for the file-watch poller. Public for the trampoline.
+    void on_watch_tick();               // periodic poll (browser + markdown)
+
 private:
     App();
 
@@ -82,6 +85,13 @@ private:
     void clamp_markdown_scroll();
     void markdown_set_cursor_from_tap(double x, double y);
     void markdown_move_cursor_vertical(int dir);   // -1 = up, +1 = down
+    // Persist the markdown buffer (when dirty) and sync the filename to the H1
+    // inline title — Obsidian-style: editing the title heading renames the
+    // file. Call wherever we leave/switch a markdown file.
+    void flush_markdown();
+    // On open, make sure the file starts with an "# <filename>" heading so the
+    // inline title is present and editable.
+    void ensure_markdown_title();
 
     // --- screen routing ---
     void enter_browser();
@@ -102,7 +112,7 @@ private:
 
     // Browser rename / tags input modal. The on-screen keyboard edits
     // input_buf_; commit_input() dispatches on input_purpose_.
-    enum class InputPurpose { Rename, Tags, NewFolder };
+    enum class InputPurpose { Rename, Tags, NewFolder, HomeFolder, ExportFolder };
     void open_rename(const std::string &id, const std::string &cur_title);
     void commit_input();   // apply the rename/tags, close the modal
     void close_input();    // dismiss without applying
@@ -135,17 +145,47 @@ private:
     void apply_template(TemplateId tmpl, const std::string &bg_image);
     void handle_template_picker_press(double x, double y);
 
+    // --- settings (home folder, export folder, file-watch toggle) ---
+    void load_config();                 // read config_path_ into the settings
+    void save_config() const;           // persist the current settings
+    void set_home_folder(const std::string &path);   // re-roots the vault
+    void open_settings();
+    void close_settings();
+    void draw_settings_modal(cairo_t *cr, int win_w, int win_h);
+    void handle_settings_release(double x, double y);
+    Rect settings_card_rect() const;
+    Rect settings_row_btn_rect(int row) const;   // edit/toggle button per row
+    Rect settings_close_btn_rect() const;
+
+    // --- file watch (Syncthing): poll the open file / browser for external
+    // updates and reload, so background syncs show up without a restart. ---
+    void start_file_watch();
+    void stop_file_watch();
+    std::string browser_signature() const;   // cheap "did the listing change?"
+
     // --- pen sample → page coordinates ---
     void map_pen_to_page(const PenSample &s, double &px, double &py);
 
     void redraw();
     void redraw_rect(double x, double y, double w, double h);
     void redraw_toolbar();   // fast partial repaint of the toolbar strip
+    void redraw_pen_menu_region();   // toolbar strip + pen dropdown panel only
     // Keyboard feedback: repaint only the key that changed so taps don't flash
     // the whole on-screen keyboard (full band only on Shift/Mode switches).
     void redraw_kbd_after_press();
     void redraw_kbd_after_release();
     void redraw_input_card();   // repaint just the rename/tags modal card
+
+    // --- page render cache (NoteView) ---
+    // Rendered page bitmaps (template + committed strokes) reused across
+    // redraws, so flipping back to a page or any partial repaint is a cheap
+    // blit instead of re-rasterising every stroke (the screen analogue of the
+    // PDF "render once to an image" path). The current page's bitmap is updated
+    // incrementally on draw/erase; others stay read-only until revisited.
+    cairo_surface_t *page_surface(int page);            // get-or-render bitmap
+    void update_page_cache_region(int page, const Rect &r);  // incremental repaint
+    void invalidate_page_cache(int page);               // drop one page's bitmap
+    void clear_page_cache();                             // drop all bitmaps
 
     // Software rotation. The Kindle's X server doesn't support XRandR, so
     // we pre-rotate the cairo context and inverse-rotate input events.
@@ -190,6 +230,14 @@ private:
     std::string   move_title_;       // its display title (for the banner)
     Note          note_;             // currently-open note
     int           current_page_ = 0;
+
+    // Page render cache. Keyed by (note id, drawing-space size); each entry is
+    // a page index + its rendered bitmap. Small LRU (front = most recent).
+    struct PageCache { int page; cairo_surface_t *surf; };
+    std::vector<PageCache> page_cache_;
+    std::string            page_cache_note_;
+    int                    page_cache_w_ = 0, page_cache_h_ = 0;
+    static constexpr int   kPageCacheMax = 3;
     std::string   markdown_path_;
     std::string   markdown_buf_;
     bool          markdown_dirty_ = false;
@@ -268,6 +316,18 @@ private:
     bool          tmpl_open_      = false;
     int           tmpl_scroll_    = 0;
     std::vector<std::string> tmpl_custom_;   // PNG filenames in vault templates/
+
+    // Settings modal + persisted config.
+    bool          settings_open_  = false;
+    std::string   config_path_;          // resolved once in load_config()
+    std::string   export_dir_;           // "" = export next to the note (default)
+    bool          watch_enabled_  = false;
+
+    // File-watch state: GLib timer source + last-seen mtimes / listing sig so
+    // we only reload (and only fire an e-ink refresh) on a real change.
+    guint         watch_source_   = 0;
+    uint32_t      md_disk_mtime_  = 0;   // mtime of markdown_path_ at last load/save
+    std::string   browser_sig_;          // signature of the current listing
 
     // Thread plumbing
     PenReader     pen_;

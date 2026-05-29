@@ -1,17 +1,51 @@
 #include "pdf_export.h"
 #include "canvas.h"
+#include "strokes.h"
 
 #include <cairo/cairo-pdf.h>
 
 namespace bn {
 
+namespace {
+
+// Styled pens (spray scatter, pencil grain, fountain/pencil variable width)
+// emit thousands of tiny vector elements per stroke. Emitting those straight
+// into the PDF content stream bloats the file and is slow to serialise, so a
+// page that crosses this budget is rasterised to a single embedded image
+// instead. Plain pen/marker pages (one polyline per stroke) stay crisp vector.
+bool page_is_heavy(const Page &p) {
+    long est = 0;
+    for (const auto &s : p.strokes) {
+        const PenStyle &ps = pen_style(s.pen_type);
+        long pts = (long)s.pts.size();
+        if      (ps.spray)                  est += pts * 8;   // scattered dots
+        else if (ps.grain)                  est += pts * 4;   // graphite specks
+        else if (ps.taper || ps.directional) est += pts * 2;  // disc + quad/seg
+        else                                est += 1;         // one polyline
+        if (est > 25000) return true;
+    }
+    return false;
+}
+
+} // namespace
+
 bool export_pdf(const std::string &out_path, const Note &n,
                 double w_pt, double h_pt,
                 double src_w, double src_h,
+                const std::string &title,
                 const std::function<void(int done, int total)> &on_progress) {
     cairo_surface_t *surf = cairo_pdf_surface_create(out_path.c_str(),
                                                      w_pt, h_pt);
     if (!surf) return false;
+#if BN_HAVE_CAIRO_TAG
+    // cairo_pdf_surface_set_metadata + CAIRO_PDF_METADATA_TITLE landed in cairo
+    // 1.16, the same release as the tag API we already probe for.
+    if (!title.empty())
+        cairo_pdf_surface_set_metadata(surf, CAIRO_PDF_METADATA_TITLE,
+                                       title.c_str());
+#else
+    (void)title;
+#endif
     cairo_t *cr = cairo_create(surf);
 
     // Scale from the on-screen capture space to PDF points. Guard against a
@@ -28,8 +62,25 @@ bool export_pdf(const std::string &out_path, const Note &n,
         cairo_save(cr);
         cairo_scale(cr, sx, sy);
         // Render the page (template + strokes) in capture-space dimensions;
-        // the scale above maps it onto the PDF page.
-        canvas_render_page(cr, n.pages[i], src_w, src_h);
+        // the scale above maps it onto the PDF page. Heavy (textured) pages are
+        // rasterised once to an embedded image so export time/size doesn't blow
+        // up with the dot count; plain pages stay vector.
+        if (page_is_heavy(n.pages[i])) {
+            cairo_surface_t *img = cairo_image_surface_create(
+                CAIRO_FORMAT_ARGB32, (int)src_w, (int)src_h);
+            if (img && cairo_surface_status(img) == CAIRO_STATUS_SUCCESS) {
+                cairo_t *ic = cairo_create(img);
+                canvas_render_page(ic, n.pages[i], src_w, src_h);
+                cairo_destroy(ic);
+                cairo_set_source_surface(cr, img, 0, 0);
+                cairo_paint(cr);
+            } else {
+                canvas_render_page(cr, n.pages[i], src_w, src_h);
+            }
+            if (img) cairo_surface_destroy(img);
+        } else {
+            canvas_render_page(cr, n.pages[i], src_w, src_h);
+        }
 
         // Link annotations targeted at other notes appear as PDF link tags;
         // viewers that support cairo_tag_begin pick them up. The tag API

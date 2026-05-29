@@ -9,7 +9,7 @@ bool    inkfb_init(int)          { return false; }
 bool    inkfb_available()        { return false; }
 int     inkfb_screen_w()         { return 0; }
 int     inkfb_screen_h()         { return 0; }
-InkRect inkfb_draw_segment(double, double, double, double, double) {
+InkRect inkfb_draw_segment(double, double, double, double, double, double, bool) {
     return InkRect{0, 0, 0, 0};
 }
 void    inkfb_settle(InkRect)    {}
@@ -70,10 +70,30 @@ void drawing_to_screen_pt(double dx, double dy, int &sx, int &sy) {
 
 void clampi(int &v, int lo, int hi) { v = std::max(lo, std::min(hi, v)); }
 
-// Set one pixel black. Handles the bpps the Kindle uses: 8 (Y8),
-// 16 (RGB565), 32 (BGRA/XRGB).
-inline void plot(int sx, int sy) {
+// Cheap xorshift RNG for the spray scatter. Not seeded per-stroke on purpose:
+// successive strokes keep adding fresh dots, which reads like real spray paint.
+inline uint32_t rng_next() {
+    static uint32_t s = 2463534242u;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return s;
+}
+
+// Ordered-dither gate: keep a black pixel only where the 4x4 Bayer threshold
+// clears `level`. level 0 → every pixel black (solid); level→1 → none.
+inline bool dither_on(int sx, int sy, double level) {
+    static const int bayer[4][4] = {
+        { 0,  8,  2, 10}, {12,  4, 14,  6},
+        { 3, 11,  1,  9}, {15,  7, 13,  5},
+    };
+    double t = (bayer[sy & 3][sx & 3] + 0.5) / 16.0;
+    return level <= t;
+}
+
+// Set one pixel black (subject to dithering). Handles the bpps the Kindle uses:
+// 8 (Y8), 16 (RGB565), 32 (BGRA/XRGB).
+inline void plot(int sx, int sy, double level) {
     if (sx < 0 || sy < 0 || sx >= g_screen_w || sy >= g_screen_h) return;
+    if (level > 0.0 && !dither_on(sx, sy, level)) return;
     size_t off = (size_t)sy * g_stride + (size_t)sx * (g_bpp / 8);
     if (off + (g_bpp / 8) > g_mem_len) return;
     switch (g_bpp) {
@@ -141,7 +161,7 @@ int  inkfb_screen_h() { return g_ok ? g_screen_h : 0; }
 
 InkRect inkfb_draw_segment(double x0, double y0,
                             double x1, double y1,
-                            double width) {
+                            double width, double ink_level, bool spray) {
     InkRect bbox{0, 0, 0, 0};
     if (!g_ok) return bbox;
 
@@ -150,16 +170,39 @@ InkRect inkfb_draw_segment(double x0, double y0,
     drawing_to_screen_pt(x1, y1, sx1, sy1);
     int radius = std::max(1, (int)std::lround(width * 0.5));
 
-    // Bresenham with a round brush of `radius`.
+    // Stamping a full disc at every Bresenham pixel is O(radius^2 * length) and
+    // massively oversampled for wide pens. The disc only needs re-stamping
+    // every ~radius/2 px to stay solid, so step the stamp; thin pens (small
+    // radius) still stamp every pixel.
+    int stamp_step = spray ? 1 : std::max(1, radius / 2);
+    // Spray density scales with the brush so a fat nib lays down more dots.
+    int spray_dots = std::max(1, radius / 3);
+
     int dx = std::abs(sx1 - sx0), sx = sx0 < sx1 ? 1 : -1;
     int dy = -std::abs(sy1 - sy0), sy = sy0 < sy1 ? 1 : -1;
     int err = dx + dy;
     int x = sx0, y = sy0;
+    int since = stamp_step;   // force a stamp on the first pixel
     while (true) {
-        for (int oy = -radius; oy <= radius; ++oy)
-            for (int ox = -radius; ox <= radius; ++ox)
-                if (ox * ox + oy * oy <= radius * radius) plot(x + ox, y + oy);
-        if (x == sx1 && y == sy1) break;
+        bool last = (x == sx1 && y == sy1);
+        if (spray) {
+            // Scatter single pixels within the brush radius. No disc, so this
+            // stays cheap, and (with no cairo resnap) the live framebuffer IS
+            // the final stroke.
+            for (int k = 0; k < spray_dots; ++k) {
+                int rx = (int)(rng_next() % (uint32_t)(2 * radius + 1)) - radius;
+                int ry = (int)(rng_next() % (uint32_t)(2 * radius + 1)) - radius;
+                if (rx * rx + ry * ry <= radius * radius)
+                    plot(x + rx, y + ry, ink_level);
+            }
+        } else if (++since >= stamp_step || last) {
+            since = 0;
+            for (int oy = -radius; oy <= radius; ++oy)
+                for (int ox = -radius; ox <= radius; ++ox)
+                    if (ox * ox + oy * oy <= radius * radius)
+                        plot(x + ox, y + oy, ink_level);
+        }
+        if (last) break;
         int e2 = 2 * err;
         if (e2 >= dy) { err += dy; x += sx; }
         if (e2 <= dx) { err += dx; y += sy; }

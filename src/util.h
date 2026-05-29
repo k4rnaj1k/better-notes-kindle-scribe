@@ -40,4 +40,8 @@ std::string slugify(const std::string &title);
 
 uint32_t now_ms();
 
+// File modification time in ms (st_mtime * 1000), or 0 if the path is missing.
+// Used by the file-watch poller to detect external (Syncthing) updates.
+uint32_t file_mtime_ms(const std::string &path);
+
 } // namespace bn

@@ -173,6 +173,10 @@ void header_buttons(double w, bool move_mode, std::vector<ActBtn> &out) {
                        BrowserAction::NewMarkdown, "+ Markdown"});
         out.push_back({{w - m - 3 * bw - 2 * g, by, bw, bh},
                        BrowserAction::NewFolder,   "+ Folder"});
+        // Compact settings button to the left of the create buttons.
+        const double sw = 120;
+        out.push_back({{w - m - 3 * bw - 2 * g - g - sw, by, sw, bh},
+                       BrowserAction::Settings,    "Settings"});
     }
 }
 
