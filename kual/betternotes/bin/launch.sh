@@ -47,6 +47,32 @@ export BN_ENABLE_INKFB=1
 # native). If the UI/writing comes out landscape, try 90/180/270.
 # export BN_ROTATION=0
 
+# --- Bluetooth keyboard (kindle-hid-passthrough) ---------------------------
+# kindle-hid-passthrough (github.com/zampierilucas/kindle-hid-passthrough)
+# connects paired Bluetooth keyboards and exposes them as /dev/input nodes;
+# BetterNotes reads those directly. If it's installed but not running, start
+# its daemon for the session and stop it again on exit (only if we started
+# it — a daemon you started yourself, or "Start on boot", is left alone).
+# BN_HID_AUTOSTART=0 skips this entirely.
+HID_DIR="/mnt/us/kindle_hid_passthrough"
+HID_STARTED=0
+if [ "${BN_HID_AUTOSTART:-1}" = "1" ]; then
+    if [ -f /etc/upstart/hid-passthrough.conf ]; then
+        if ! status hid-passthrough 2>/dev/null | grep -q "start/running"; then
+            start hid-passthrough >/dev/null 2>&1 && HID_STARTED=upstart
+        fi
+    elif [ -x "$HID_DIR/kindle-hid-passthrough" ] &&
+         ! pgrep -f "$HID_DIR/kindle-hid-passthrough" >/dev/null 2>&1; then
+        "$HID_DIR/kindle-hid-passthrough" --daemon >/tmp/hid_passthrough.log 2>&1 &
+        HID_STARTED=$!
+    fi
+fi
+
+# Keyboard input knobs. By default BetterNotes takes exclusive use (EVIOCGRAB)
+# of every keyboard so keys don't also reach the framework.
+# export BN_KBD_GRAB=0     # share the keyboard instead
+# export BN_KBD_EVDEV=0    # ignore /dev/input; take keys from X instead
+
 # Pen orientation overrides. Defaults: swap=0 ix=0 iy=0. Calibrate by drawing
 # a dot in each corner and reading the "pen-down raw=... -> page=..." lines in
 # /tmp/betternotes.log, then set these so the corners map correctly. Each 0/1.
@@ -66,6 +92,13 @@ done
 
 kill "$APP_PID" 2>/dev/null
 rm -f "$MARKER"
+
+# Give the Bluetooth radio back if we were the ones holding it.
+if [ "$HID_STARTED" = "upstart" ]; then
+    stop hid-passthrough >/dev/null 2>&1
+elif [ "$HID_STARTED" != "0" ]; then
+    kill "$HID_STARTED" 2>/dev/null
+fi
 
 # Thaw framework
 lipc-set-prop com.lab126.pillow disableEnablePillow enable 2>/dev/null
