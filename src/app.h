@@ -82,6 +82,7 @@ public:
     bool on_gtk_key(GdkEventKey *e);     // X keyboard path (see app_keys.cpp)
     void process_async_events();         // drains pen_queue_ + ocr_queue_
     void on_watch_tick();                // file-watch poll (browser + markdown)
+    void bt_tick();                      // Bluetooth page poll of the daemon
 
     // X11 window coords → drawing-space coords (inverse of the cairo
     // rotation applied in on_draw).
@@ -282,7 +283,6 @@ private:
     void     draw_bluetooth(cairo_t *cr, int win_w, int win_h);
     void     handle_bluetooth_release(double x, double y);
     void     key_bluetooth(const KeyEvent &e);
-    void     bt_tick();                  // timer: poll the daemon
     void     bt_poll();                  // /status → /scan-status → /pair-status → /logs
     void     bt_poll_scan();
     void     bt_poll_pair();
