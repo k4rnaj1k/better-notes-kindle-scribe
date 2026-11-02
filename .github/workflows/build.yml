@@ -150,10 +150,15 @@ jobs:
           echo "$HOME/x-tools/arm-${TARGET}-linux-gnueabihf/bin" >> $GITHUB_PATH
 
       - name: Build betternotes
+        shell: bash
         run: |
           rm -rf builddir_kindle
-          meson setup --cross-file "$MESON_CROSS" builddir_kindle
-          meson compile -C builddir_kindle
+          meson setup --cross-file "$MESON_CROSS" builddir_kindle 2>&1 | tee build.log
+          meson compile -C builddir_kindle 2>&1 | tee -a build.log
+
+      - name: Annotate build errors
+        if: failure()
+        run: sh .github/annotate-errors.sh build.log
 
       - name: Stage KUAL extension
         run: |
