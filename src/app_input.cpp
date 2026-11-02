@@ -392,6 +392,9 @@ void App::handle_browser_action(const BrowserHit &h) {
         case BrowserAction::Settings:
             open_settings();
             break;
+        case BrowserAction::Quit:
+            quit();
+            break;
         default: break;
     }
 }

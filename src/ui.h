@@ -78,7 +78,7 @@ void ui_text_size(cairo_t *cr, const std::string &t, const char *font,
 // Line icons centred at (cx, cy) with half-extent s, in the current grey.
 enum class Icon {
     Plus, Gear, Folder, Notebook, Markdown, Up, Pencil, Move, Trash, Close,
-    Check, Keyboard, Globe, Bluetooth,
+    Check, Keyboard, Globe, Bluetooth, Power,
 };
 void ui_icon(cairo_t *cr, Icon icon, double cx, double cy, double s);
 

@@ -118,7 +118,7 @@ struct ActBtn {
     Rect r; BrowserAction action; const char *label; Icon icon; Btn style;
 };
 
-// Header buttons (right-aligned): New folder/note/markdown + settings, or the
+// Header buttons (right-aligned): New folder/note/markdown, settings and exit, or the
 // move controls while a move is in flight.
 void header_buttons(double w, bool move_mode, std::vector<ActBtn> &out) {
     out.clear();
@@ -137,9 +137,11 @@ void header_buttons(double w, bool move_mode, std::vector<ActBtn> &out) {
                    "Markdown", Icon::Plus, Btn::Secondary});
     out.push_back({{w - m - 3 * bw - 2 * g, by, bw, bh}, BrowserAction::NewFolder,
                    "Folder", Icon::Plus, Btn::Secondary});
-    // Icon-only settings button to the left of the create buttons.
+    // Icon-only settings and exit buttons to the left of the create buttons.
     out.push_back({{w - m - 3 * bw - 3 * g - bh, by, bh, bh}, BrowserAction::Settings,
                    "", Icon::Gear, Btn::Ghost});
+    out.push_back({{w - m - 3 * bw - 4 * g - 2 * bh, by, bh, bh}, BrowserAction::Quit,
+                   "", Icon::Power, Btn::Ghost});
 }
 
 // Per-tile actions along the bottom of an entry tile. Empty in move mode

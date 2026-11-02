@@ -269,6 +269,12 @@ void ui_icon(cairo_t *cr, Icon icon, double cx, double cy, double s) {
         cairo_line_to(cr, cx - s * 0.5, cy + s * 0.45);
         cairo_stroke(cr);
         break;
+    case Icon::Power:   // a broken ring with a stem through the gap
+        cairo_arc(cr, cx, cy + s * 0.08, s * 0.78, -M_PI / 2 + 0.75, 3 * M_PI / 2 - 0.75);
+        cairo_stroke(cr);
+        line(cr, cx, cy - s * 0.95, cx, cy - s * 0.1);
+        cairo_stroke(cr);
+        break;
     case Icon::Globe:
         cairo_arc(cr, cx, cy, s * 0.85, 0, 2 * M_PI);
         cairo_stroke(cr);

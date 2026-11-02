@@ -56,13 +56,18 @@ export BN_ENABLE_INKFB=1
 # BN_HID_AUTOSTART=0 skips this entirely.
 HID_DIR="/mnt/us/kindle_hid_passthrough"
 HID_STARTED=0
+# The launcher execs a bundled loader running dist/main.bin, so look for that
+# (or the Python dev build) rather than the launcher's own name.
+hid_running() {
+    pgrep -f "$HID_DIR/dist/main.bin" >/dev/null 2>&1 ||
+        pgrep -f "main.py --daemon" >/dev/null 2>&1
+}
 if [ "${BN_HID_AUTOSTART:-1}" = "1" ]; then
     if [ -f /etc/upstart/hid-passthrough.conf ]; then
         if ! status hid-passthrough 2>/dev/null | grep -q "start/running"; then
             start hid-passthrough >/dev/null 2>&1 && HID_STARTED=upstart
         fi
-    elif [ -x "$HID_DIR/kindle-hid-passthrough" ] &&
-         ! pgrep -f "$HID_DIR/kindle-hid-passthrough" >/dev/null 2>&1; then
+    elif [ -x "$HID_DIR/kindle-hid-passthrough" ] && ! hid_running; then
         "$HID_DIR/kindle-hid-passthrough" --daemon >/tmp/hid_passthrough.log 2>&1 &
         HID_STARTED=$!
     fi
@@ -98,6 +103,7 @@ if [ "$HID_STARTED" = "upstart" ]; then
     stop hid-passthrough >/dev/null 2>&1
 elif [ "$HID_STARTED" != "0" ]; then
     kill "$HID_STARTED" 2>/dev/null
+    pkill -f "$HID_DIR/dist/main.bin" 2>/dev/null
 fi
 
 # Thaw framework

@@ -20,6 +20,7 @@ enum class BrowserAction {
     MoveHere,      // drop the in-flight move into the current directory
     MoveCancel,    // abort the in-flight move
     Settings,      // open the app settings modal
+    Quit,          // save and exit BetterNotes
 };
 
 struct BrowserHit {
