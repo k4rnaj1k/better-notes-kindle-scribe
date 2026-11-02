@@ -11,7 +11,7 @@ T=/src/tests/ui
 
 cp -r /src /work && cd /work
 meson setup b >/dev/null || exit 1
-if ! ninja -C b >/tmp/build.log 2>&1; then
+if ! ninja -k 0 -C b >/tmp/build.log 2>&1; then
     grep -E "error|FAILED" /tmp/build.log | head -60
     exit 1
 fi

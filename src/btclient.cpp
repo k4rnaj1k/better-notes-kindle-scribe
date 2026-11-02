@@ -192,8 +192,8 @@ void bt_start_service() {
         "else " + std::string(q) + " --daemon >/tmp/hid_passthrough.log 2>&1 & fi";
     g_free(q);
     gchar *argv[] = {(gchar *)"/bin/sh", (gchar *)"-c", (gchar *)script.c_str(), nullptr};
-    g_spawn_async(nullptr, argv, nullptr, G_SPAWN_STDOUT_TO_DEV_NULL |
-                  G_SPAWN_STDERR_TO_DEV_NULL, nullptr, nullptr, nullptr, nullptr);
+    auto flags = (GSpawnFlags)(G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL);
+    g_spawn_async(nullptr, argv, nullptr, flags, nullptr, nullptr, nullptr, nullptr);
 }
 
 } // namespace bn
