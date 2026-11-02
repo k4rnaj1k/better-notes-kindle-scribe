@@ -1,5 +1,7 @@
 #include "toolbar.h"
 
+#include "ui.h"
+
 #include <pango/pangocairo.h>
 #include <algorithm>
 #include <cmath>
@@ -268,23 +270,17 @@ void draw_icon(cairo_t *cr, ToolbarAction action,
 }
 
 void draw_button(cairo_t *cr, const ToolbarButton &b, bool active) {
+    // Borderless icon buttons; the active tool is an inked rounded square
+    // with a white icon, a pressed one a light grey square. The square is
+    // drawn inside the hit rect so a single-button repaint covers it.
     double x = b.rect.x, y = b.rect.y, w = b.rect.w, h = b.rect.h;
-    cairo_set_source_rgba(cr, 0, 0, 0, b.pressed ? 0.05 : 0.12);
-    cairo_rectangle(cr, x + 2, y + 2, w, h); cairo_fill(cr);
+    double side = std::min(w - 6, h - 4);
+    Rect sq{x + (w - side) / 2.0, y + (h - side) / 2.0, side, side};
+    if (active)         ui_fill_round(cr, sq, theme::kRadiusSm + 2, theme::kInk);
+    else if (b.pressed) ui_fill_round(cr, sq, theme::kRadiusSm + 2, theme::kPressed);
 
-    if (active)         cairo_set_source_rgb(cr, 0.20, 0.20, 0.20);
-    else if (b.pressed) cairo_set_source_rgb(cr, 0.65, 0.65, 0.65);
-    else                cairo_set_source_rgb(cr, 0.92, 0.92, 0.92);
-    cairo_rectangle(cr, x, y, w, h); cairo_fill(cr);
-
-    cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
-    cairo_set_line_width(cr, 1.5);
-    cairo_rectangle(cr, x, y, w, h); cairo_stroke(cr);
-
-    // Icon, centred, sized to the smaller button dimension.
-    double s = std::min(w, h) * 0.28;
-    double col = active ? 0.95 : 0.12;
-    cairo_set_source_rgb(cr, col, col, col);
+    double s = side * 0.24;
+    ui_grey(cr, active ? theme::kPaper : theme::kInk);
     draw_icon(cr, b.action, x + w / 2.0, y + h / 2.0, s);
 }
 
@@ -292,13 +288,14 @@ void draw_button(cairo_t *cr, const ToolbarButton &b, bool active) {
 
 void Toolbar::layout(double width, ToolbarMode mode) {
     width_  = width;
+    mode_   = mode;
     // Tall toolbar for finger-friendly tap targets. Button *width* is
     // computed to fit every button in one row, so it scales with screen
     // width instead of overflowing. A thin status strip sits at the bottom.
     height_ = 120.0;
     const double m = 8.0;
     const double gap = 6.0;
-    const double status_h = 22.0;
+    const double status_h = 30.0;
     buttons_.clear();
 
     static const ToolbarAction note_defs[] = {
@@ -355,25 +352,27 @@ constexpr double kWidthRowH = 64.0;   // height of the width-chip row
 constexpr double kTypeRowH  = 84.0;   // height of each pen-type row
 } // namespace
 
-double Toolbar::pen_menu_w() const { return std::max(pen_btn_rect_.w, 380.0); }
+double Toolbar::pen_menu_w() const { return std::max(pen_btn_rect_.w, 400.0); }
 
 double Toolbar::pen_menu_x() const {
     double w = pen_menu_w();
-    double x = pen_btn_rect_.x;
-    if (x + w > width_) x = width_ - w;   // keep the panel on-screen
-    if (x < 0) x = 0;
+    double x = pen_btn_rect_.x + 4;
+    if (x + w > width_ - 12) x = width_ - 12 - w;   // keep the panel on-screen
+    if (x < 12) x = 12;
     return x;
 }
 
+// The panel is a card hanging 8 px below the toolbar; chips and rows sit
+// inside it with 12 px padding.
 Rect Toolbar::pen_menu_width_rect(int i) const {
-    double w  = pen_menu_w();
-    double cw = w / kPenWidthCount;
-    return Rect{pen_menu_x() + i * cw, height_, cw, kWidthRowH};
+    double inner = pen_menu_w() - 24;
+    double cw = inner / kPenWidthCount;
+    return Rect{pen_menu_x() + 12 + i * cw, height_ + 20, cw, kWidthRowH};
 }
 
 Rect Toolbar::pen_menu_type_rect(int i) const {
-    return Rect{pen_menu_x(), height_ + kWidthRowH + i * kTypeRowH,
-                pen_menu_w(), kTypeRowH};
+    return Rect{pen_menu_x() + 12, height_ + 20 + kWidthRowH + 12 + i * kTypeRowH,
+                pen_menu_w() - 24, kTypeRowH};
 }
 
 PenMenuHit Toolbar::pen_menu_hit(double x, double y) const {
@@ -396,20 +395,21 @@ double Toolbar::pen_menu_extent() const {
 }
 
 Rect Toolbar::pen_menu_panel_rect() const {
+    // Includes the card's padding and drop shadow, so repainting this rect
+    // after the menu closes leaves nothing behind.
     double top = height_;
-    return Rect{pen_menu_x(), top, pen_menu_w(), pen_menu_extent() - top};
+    return Rect{pen_menu_x() - 8, top, pen_menu_w() + 16,
+                pen_menu_extent() - top + 12 + theme::kShadowDy};
 }
 
 void Toolbar::draw(cairo_t *cr, const ToolState &st,
-                   const std::string &status, int page, int total) {
+                   const std::string &status, int page, int total,
+                   const char *badge) {
     if (!visible_) return;   // App draws a "show" tab instead.
 
-    cairo_set_source_rgb(cr, 0.97, 0.97, 0.97);
+    ui_grey(cr, theme::kPaper);
     cairo_rectangle(cr, 0, 0, width_, height_); cairo_fill(cr);
-    cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
-    cairo_set_line_width(cr, 1.0);
-    cairo_move_to(cr, 0, height_); cairo_line_to(cr, width_, height_);
-    cairo_stroke(cr);
+    ui_hline(cr, 0, width_, height_ - 1, theme::kLine, 1.5);
 
     for (auto &b : buttons_) {
         bool active = false;
@@ -425,27 +425,34 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
         draw_button(cr, b, active);
     }
 
-    // Status strip at the bottom of the toolbar.
-    PangoLayout *layout = pango_cairo_create_layout(cr);
-    PangoFontDescription *fd = pango_font_description_from_string("Sans 12");
-    pango_layout_set_font_description(layout, fd);
-    pango_font_description_free(fd);
-    char buf[160];
-    if (st.current == Tool::Pen) {
-        std::snprintf(buf, sizeof(buf), "%s %s   p%d/%d   %s",
-                      pen_display_name(st.pen_type),
-                      kPenWidthNames[st.pen_width_idx], page + 1, total,
+    // Status strip: current tool, then the page, then the latest message;
+    // the keyboard-layout badge sits on the right.
+    double sy = height_ - 25;
+    char tool[64];
+    if (mode_ == ToolbarMode::Markdown)
+        std::snprintf(tool, sizeof(tool), "Markdown");
+    else if (st.current == Tool::Pen)
+        std::snprintf(tool, sizeof(tool), "%s %s", pen_display_name(st.pen_type),
+                      kPenWidthNames[st.pen_width_idx]);
+    else
+        std::snprintf(tool, sizeof(tool), "%s", tool_label(st.current));
+    int tw, th;
+    ui_text_size(cr, tool, "Sans Bold 12", &tw, &th);
+    ui_text(cr, 14, sy, tool, "Sans Bold 12", theme::kInk);
+    char rest[200];
+    if (mode_ == ToolbarMode::Note)
+        std::snprintf(rest, sizeof(rest), "·   page %d of %d   %s%s", page + 1,
+                      total, status.empty() ? "" : "·   ", status.c_str());
+    else
+        std::snprintf(rest, sizeof(rest), "%s%s", status.empty() ? "" : "·   ",
                       status.c_str());
-    } else {
-        std::snprintf(buf, sizeof(buf), "%s   p%d/%d   %s",
-                      tool_label(st.current), page + 1, total,
-                      status.c_str());
+    ui_text_ellipsized(cr, 14 + tw + 12, sy, width_ - tw - 140, rest,
+                       "Sans 12", theme::kMuted, false);
+    if (badge && *badge) {
+        double bw = ui_pill_width(cr, badge, "Sans Bold 11");
+        ui_pill(cr, Rect{width_ - bw - 14, sy - 1, bw, 20}, badge, false,
+                "Sans Bold 11");
     }
-    pango_layout_set_text(layout, buf, -1);
-    cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
-    cairo_move_to(cr, 12, height_ - 20);
-    pango_cairo_show_layout(cr, layout);
-    g_object_unref(layout);
 
     // Pen dropdown, drawn last so it overlays the canvas below: a row of width
     // chips, then one preview row per pen type.
@@ -515,65 +522,50 @@ void draw_pen_sample(cairo_t *cr, PenType type, double ew,
 } // namespace
 
 void Toolbar::draw_pen_menu(cairo_t *cr, const ToolState &st) {
-    // Width chips.
+    // Floating card under the Pen button.
+    Rect last = pen_menu_type_rect(kPenTypeCount - 1);
+    Rect card{pen_menu_x(), height_ + 8, pen_menu_w(),
+              last.y + last.h + 12 - (height_ + 8)};
+    ui_card(cr, card);
+
+    // Width chips: a dot sized to the base width over the size name; the
+    // selected one is inked.
     for (int i = 0; i < kPenWidthCount; ++i) {
         Rect r = pen_menu_width_rect(i);
+        Rect chip{r.x + 4, r.y + 4, r.w - 8, r.h - 8};
         bool active = (i == st.pen_width_idx);
-        double bg = active ? 0.20 : 0.97;
-        cairo_set_source_rgb(cr, bg, bg, bg);
-        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr);
-        cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
-        cairo_set_line_width(cr, 1.5);
-        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_stroke(cr);
-
-        // A dot sized to the raw base width, plus the size label.
-        double fg = active ? 0.95 : 0.12;
-        cairo_set_source_rgb(cr, fg, fg, fg);
-        cairo_arc(cr, r.x + r.w / 2.0, r.y + r.h * 0.36,
-                  std::min(kPenWidths[i] * 0.7 + 2.0, r.h * 0.22), 0, 2 * M_PI);
+        ui_fill_round(cr, chip, theme::kRadiusSm, active ? theme::kInk : theme::kSurface);
+        double fg = active ? theme::kPaper : theme::kInk;
+        ui_grey(cr, fg);
+        cairo_arc(cr, chip.x + chip.w / 2.0, chip.y + chip.h * 0.36,
+                  std::min(kPenWidths[i] * 0.7 + 2.0, chip.h * 0.2), 0, 2 * M_PI);
         cairo_fill(cr);
-
-        PangoLayout *l = pango_cairo_create_layout(cr);
-        PangoFontDescription *fd = pango_font_description_from_string("Sans 14");
-        pango_layout_set_font_description(l, fd);
-        pango_font_description_free(fd);
-        pango_layout_set_text(l, kPenWidthNames[i], -1);
-        int tw, th; pango_layout_get_pixel_size(l, &tw, &th);
-        cairo_move_to(cr, r.x + (r.w - tw) / 2.0, r.y + r.h - th - 6);
-        pango_cairo_show_layout(cr, l);
-        g_object_unref(l);
+        int tw, th; ui_text_size(cr, kPenWidthNames[i], "Sans Bold 13", &tw, &th);
+        ui_text(cr, chip.x + (chip.w - tw) / 2.0, chip.y + chip.h - th - 5,
+                kPenWidthNames[i], "Sans Bold 13", fg);
     }
 
-    // Pen-type rows.
+    // Pen-type rows: a live sample of the stroke, then the name. Hairlines
+    // between rows; the selected pen is an inked row.
     for (int i = 0; i < kPenTypeCount; ++i) {
         Rect r = pen_menu_type_rect(i);
         PenType type = kPenTypeMenu[i];
         bool active = (st.current == Tool::Pen && type == st.pen_type);
-
-        double bg = active ? 0.20 : 0.97;
-        cairo_set_source_rgb(cr, bg, bg, bg);
-        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr);
-        cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
-        cairo_set_line_width(cr, 1.5);
-        cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_stroke(cr);
+        if (active) ui_fill_round(cr, r, theme::kRadiusSm, theme::kInk);
+        else if (i > 0) ui_hline(cr, r.x + 12, r.x + r.w - 12, r.y, theme::kLine);
 
         double cy = r.y + r.h * 0.5;
         double ew = effective_pen_width(type, st.pen_width_idx);
-        ew = std::min(ew, r.h * 0.5);   // clamp so a wide highlighter still fits
-        draw_pen_sample(cr, type, ew, r.x + 22, r.x + 150, cy, active);
+        ew = std::min(ew, r.h * 0.45);   // clamp so a wide highlighter still fits
+        draw_pen_sample(cr, type, ew, r.x + 24, r.x + 140, cy, active);
 
-        PangoLayout *il = pango_cairo_create_layout(cr);
-        PangoFontDescription *ifd = pango_font_description_from_string("Sans 20");
-        pango_layout_set_font_description(il, ifd);
-        pango_font_description_free(ifd);
-        pango_layout_set_text(il, pen_display_name(type), -1);
-        int tw, th; pango_layout_get_pixel_size(il, &tw, &th);
-        (void)tw;
-        double fg = active ? 0.95 : 0.12;
-        cairo_set_source_rgb(cr, fg, fg, fg);
-        cairo_move_to(cr, r.x + 170, cy - th / 2.0);
-        pango_cairo_show_layout(cr, il);
-        g_object_unref(il);
+        int tw, th; ui_text_size(cr, pen_display_name(type), "Sans 19", &tw, &th);
+        ui_text(cr, r.x + 166, cy - th / 2.0, pen_display_name(type), "Sans 19",
+                active ? theme::kPaper : theme::kInk);
+        if (active) {
+            ui_grey(cr, theme::kPaper);
+            ui_icon(cr, Icon::Check, r.x + r.w - 32, cy, 12);
+        }
     }
 }
 

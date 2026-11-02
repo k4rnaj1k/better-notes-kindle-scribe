@@ -1,0 +1,41 @@
+name: UI test
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ui:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build test image
+        run: docker build -q -t bn-test tests/ui
+
+      - name: Host build + scripted session
+        shell: bash
+        run: |
+          mkdir -p ui-shots
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/ui-shots":/out bn-test \
+            sh /src/tests/ui/run.sh 2>&1 | tee ui-shots/session.log
+
+      - name: Summarize session
+        if: success()
+        run: |
+          # Everything but the app log: saved files, config, fake daemon calls.
+          sed '/^--- log$/,/^--- fake daemon$/d' ui-shots/session.log | head -150 |
+            sed 's/%/%25/g' | awk 'BEGIN { printf "::notice title=session::" }
+              { printf "%s%%0A", $0 } END { print "" }'
+
+      - name: Annotate errors
+        if: failure()
+        run: sh .github/annotate-errors.sh ui-shots/session.log
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-screenshots-${{ github.sha }}
+          path: ui-shots

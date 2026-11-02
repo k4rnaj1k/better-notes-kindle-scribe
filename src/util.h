@@ -35,7 +35,8 @@ bool remove_path(const std::string &path);
 // Move/rename a file or directory. Returns true on success.
 bool rename_path(const std::string &from, const std::string &to);
 
-// Slugify a title into a safe directory name.
+// Slugify a title into a safe directory name. ASCII is lower-cased and
+// punctuation dropped; UTF-8 letters are kept as-is.
 std::string slugify(const std::string &title);
 
 uint32_t now_ms();

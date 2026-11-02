@@ -94,7 +94,9 @@ bool rename_path(const std::string &from, const std::string &to) {
 std::string slugify(const std::string &title) {
     std::string out; out.reserve(title.size());
     for (char c : title) {
-        if ((c >= 'a' && c <= 'z') ||
+        // Non-ASCII (UTF-8) bytes pass through untouched so Cyrillic and
+        // other non-Latin names survive instead of collapsing to "untitled".
+        if ((c >= 'a' && c <= 'z') || (unsigned char)c >= 0x80 ||
             (c >= '0' && c <= '9') || c == '-' || c == '_')
             out += c;
         else if (c >= 'A' && c <= 'Z')

@@ -53,8 +53,11 @@ struct ToolbarButton {
 class Toolbar {
 public:
     void layout(double width, ToolbarMode mode = ToolbarMode::Note);
+    // badge: short text shown on the right of the status strip (the
+    // keyboard layout), or nullptr for none.
     void draw(cairo_t *cr, const ToolState &st,
-              const std::string &status, int page, int total);
+              const std::string &status, int page, int total,
+              const char *badge = nullptr);
 
     // Returns the action whose rect contains (x, y), or ::None.
     ToolbarAction hit(double x, double y) const;
@@ -106,6 +109,7 @@ private:
     std::vector<ToolbarButton> buttons_;
     double height_ = 0;
     double width_  = 0;
+    ToolbarMode mode_ = ToolbarMode::Note;
     bool   visible_ = true;
     bool   pen_menu_open_ = false;
     Rect   pen_btn_rect_{};   // Pen button rect, anchors the dropdown
