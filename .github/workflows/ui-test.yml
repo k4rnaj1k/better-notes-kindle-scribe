@@ -21,6 +21,14 @@ jobs:
           docker run --rm -v "$PWD":/src:ro -v "$PWD/ui-shots":/out bn-test \
             sh /src/tests/ui/run.sh 2>&1 | tee ui-shots/session.log
 
+      - name: Summarize session
+        if: success()
+        run: |
+          # Everything but the app log: saved files, config, fake daemon calls.
+          sed '/^--- log$/,/^--- fake daemon$/d' ui-shots/session.log | head -150 |
+            sed 's/%/%25/g' | awk 'BEGIN { printf "::notice title=session::" }
+              { printf "%s%%0A", $0 } END { print "" }'
+
       - name: Annotate errors
         if: failure()
         run: sh .github/annotate-errors.sh ui-shots/session.log
