@@ -429,7 +429,9 @@ void Toolbar::draw(cairo_t *cr, const ToolState &st,
     // the keyboard-layout badge sits on the right.
     double sy = height_ - 25;
     char tool[64];
-    if (st.current == Tool::Pen)
+    if (mode_ == ToolbarMode::Markdown)
+        std::snprintf(tool, sizeof(tool), "Markdown");
+    else if (st.current == Tool::Pen)
         std::snprintf(tool, sizeof(tool), "%s %s", pen_display_name(st.pen_type),
                       kPenWidthNames[st.pen_width_idx]);
     else

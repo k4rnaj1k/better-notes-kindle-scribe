@@ -543,8 +543,8 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
             else          draw_settings_modal(cr, win_w, win_h);
         }
         if (input_open_) {
-            keyboard_.draw(cr);
             draw_input_modal(cr);
+            keyboard_.draw(cr);
         }
         if (confirm_open_) draw_confirm_modal(cr, win_w, win_h);
         return;
@@ -555,7 +555,8 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
     if (screen_ == Screen::NoteView) draw_note_view(cr, win_w, win_h);
     else                             draw_markdown_view(cr, win_w, win_h);
 
-    keyboard_.draw(cr);   // no-op when hidden
+    // A text dialog dims the page, toolbar included; the keyboard stays on top.
+    if (!input_open_) keyboard_.draw(cr);   // no-op when hidden
 
     // Floating "show toolbar" tab whenever the toolbar is hidden.
     if (!toolbar_.visible()) draw_show_tab(cr);
@@ -569,7 +570,10 @@ void App::on_draw(cairo_t *cr, int win_w, int win_h) {
     // Modals, bottom to top.
     if (picker_.open)  draw_link_picker(cr, win_w, win_h);
     if (tmpl_open_)    draw_template_picker(cr, win_w, win_h);
-    if (input_open_)   draw_input_modal(cr);       // tags editor over a note
+    if (input_open_) {                             // tags editor over a note
+        draw_input_modal(cr);
+        keyboard_.draw(cr);
+    }
     if (draw_open_)    draw_draw_modal(cr, win_w, win_h);
     if (exporting_pdf_) draw_export_overlay(cr, win_w, win_h);
 }

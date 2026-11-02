@@ -99,6 +99,7 @@ void App::commit_input() {
 void App::draw_input_modal(cairo_t *cr) {
     using namespace theme;
     Rect c = modal_card_rect();
+    ui_backdrop(cr, win_w_, win_h_);
     ui_card(cr, c);
     ui_text(cr, c.x + 28, c.y + 26, input_title_, kFontHead);
 
@@ -150,11 +151,11 @@ void App::draw_input_modal(cairo_t *cr) {
         const char *badge = layout_badge(layout_);
         double bw = ui_pill_width(cr, badge, "Sans Bold 13");
         ui_pill(cr, Rect{hx, save.y + 16, bw, 28}, badge, false, "Sans Bold 13");
-        hx += bw + 12;
     }
     if (input_purpose_ == InputPurpose::Tags)
-        ui_text(cr, hx, save.y + 19, hw_keyboard() ? "comma-separated, Tab: scope"
-                                                   : "comma-separated",
+        ui_text(cr, f.x + 4, f.y + f.h + 8,
+                hw_keyboard() ? "Comma-separated. Tab switches page / notebook."
+                              : "Comma-separated.",
                 kFontSmall, kMuted);
     ui_button(cr, save, "Save", Btn::Primary);
     ui_button(cr, modal_btn_rect(false), "Cancel", Btn::Secondary);
@@ -266,7 +267,7 @@ void App::commit_tags() {
 
 Rect App::tags_scope_btn_rect() const {
     Rect c = modal_card_rect();
-    double bw = 250, bh = 50;
+    double bw = 300, bh = 50;
     return Rect{c.x + c.w - 28 - bw, c.y + 18, bw, bh};
 }
 

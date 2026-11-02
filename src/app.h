@@ -293,6 +293,7 @@ private:
     void     bt_scan();
     void     bt_toggle_power();
     std::string bt_signature() const;
+    void     bt_repaint();
     // Poll the open file / browser for external (Syncthing) updates and reload,
     // so background syncs show up without a restart.
     void start_file_watch();
@@ -445,6 +446,7 @@ private:
         int         ticks = 0;
         guint       timer = 0;
         std::string sig;                 // what's on screen, to skip no-op repaints
+        Rect        last_card;           // card as last painted
     } bt_;
 
     // File-watch state: GLib timer source + last-seen mtimes / listing sig so

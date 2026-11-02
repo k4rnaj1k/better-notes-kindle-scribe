@@ -16,6 +16,9 @@ namespace {
 constexpr double kLinkPickerW = 640, kLinkPickerH = 960;
 constexpr double kTmplPickerW = 560, kTmplPickerH = 880;
 
+// The template list is short; size its card to the rows instead of the max.
+double tmpl_picker_h(int rows) { return std::min(kTmplPickerH, 100.0 + rows * 72.0 + 24.0); }
+
 // Shared press handling for a scrollable list modal: close box / outside →
 // Close, top/bottom 40 px of the list → page the scroll (Scrolled), a row →
 // Row with its absolute index in row_idx.
@@ -91,7 +94,7 @@ bool App::key_list_modal(const KeyEvent &e) {
     int &scroll = link ? picker_.scroll : tmpl_scroll_;
     int total   = link ? (int)picker_.entries.size() : template_count();
     ListModal m = link ? ListModal::make(win_w_, win_h_, kLinkPickerW, kLinkPickerH)
-                       : ListModal::make(win_w_, win_h_, kTmplPickerW, kTmplPickerH);
+                       : ListModal::make(win_w_, win_h_, kTmplPickerW, tmpl_picker_h(template_count()));
     int page = std::max(1, m.rows_visible);
 
     int nsel = sel;
@@ -248,7 +251,7 @@ void App::pick_template(int idx) {
 }
 
 void App::handle_template_picker_press(double x, double y) {
-    ListModal m = ListModal::make(win_w_, win_h_, kTmplPickerW, kTmplPickerH);
+    ListModal m = ListModal::make(win_w_, win_h_, kTmplPickerW, tmpl_picker_h(template_count()));
     int idx = -1;
     switch (list_press(m, x, y, tmpl_scroll_, template_count(), idx)) {
     case ListPress::Close:    tmpl_open_ = false; redraw(); break;
@@ -260,7 +263,7 @@ void App::handle_template_picker_press(double x, double y) {
 
 void App::draw_template_picker(cairo_t *cr, int win_w, int win_h) {
     using namespace theme;
-    ListModal m = ListModal::make(win_w, win_h, kTmplPickerW, kTmplPickerH);
+    ListModal m = ListModal::make(win_w, win_h, kTmplPickerW, tmpl_picker_h(template_count()));
     m.draw_frame(cr, win_w, win_h, "Page template",
                  tmpl_custom_.empty() ? "add your own: PNGs in the vault's templates/ folder"
                                       : "built-in papers and your PNGs");

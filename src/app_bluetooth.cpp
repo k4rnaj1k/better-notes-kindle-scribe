@@ -38,7 +38,7 @@ bool same_addr(const std::string &a, const std::string &b) {
 }
 
 std::string display_name(const BtDevice &d) {
-    return d.name.empty() ? d.address : d.name;
+    return d.name.empty() ? "Unnamed device" : d.name;
 }
 
 const char *protocol_label(const BtDevice &d) {
@@ -58,6 +58,7 @@ void App::open_bluetooth() {
     status_ = "bluetooth";
     if (!bt_.timer) bt_.timer = g_timeout_add(kTickMs, cb_bt_tick, this);
     bt_poll();
+    bt_.last_card = bt_layout().card;
     redraw();
 }
 
@@ -152,7 +153,7 @@ void App::bt_poll_done() {
     std::string sig = bt_signature();
     if (sig == bt_.sig) return;   // nothing visible changed: no e-ink refresh
     bt_.sig = sig;
-    if (settings_open_ && !input_open_) redraw_rect(bt_layout().card);
+    if (settings_open_ && !input_open_) bt_repaint();
 }
 
 void App::bt_set_found(std::vector<BtDevice> devs) {
@@ -173,6 +174,16 @@ void App::bt_set_found(std::vector<BtDevice> devs) {
         return a.rssi > b.rssi;
     });
     bt_.found = std::move(out);
+}
+
+// Repaint the card. When its size changed (rows came or went), repaint the
+// whole screen so the backdrop where the old card stood is redrawn too.
+void App::bt_repaint() {
+    Rect r = bt_layout().card, &o = bt_.last_card;
+    bool same = r.x == o.x && r.y == o.y && r.w == o.w && r.h == o.h;
+    bt_.last_card = r;
+    if (same) redraw_rect(r);
+    else      redraw();
 }
 
 std::string App::bt_signature() const {
@@ -206,7 +217,7 @@ void App::bt_scan() {
         bt_poll();
     });
     bt_.sig.clear();
-    redraw_rect(bt_layout().card);
+    bt_repaint();
 }
 
 void App::bt_toggle_power() {
@@ -256,7 +267,7 @@ void App::bt_activate(int row) {
         });
     }
     bt_.sig.clear();
-    redraw_rect(L.card);
+    bt_repaint();
 }
 
 void App::bt_forget(int row) {
@@ -275,15 +286,27 @@ void App::bt_forget(int row) {
                    });
     }
     bt_.sig.clear();
-    redraw_rect(L.card);
+    bt_repaint();
 }
 
 // ------------------------------------------------------------------- layout
 
 BtLayout App::bt_layout() const {
     BtLayout L;
+    // The card is as tall as its content, up to the window: header, the
+    // paired rows, room for at least one nearby row, the banner and footer.
+    double max_h = (double)win_h_ - 240.0;
+    double ch = 560.0;   // service missing / Bluetooth off
+    if (bt_.reached && bt_.st.running) {
+        int np = std::min((int)bt_.st.paired.size(), kMaxPaired);
+        double fixed = 124 + kSectionH + (np ? np * kRowH : 64.0) + 28 + kSectionH + 16 +
+                       12 + kBannerH + 24 + 60 + 28;
+        int fit = std::max(1, (int)((max_h - fixed) / kRowH));
+        int nearby = std::clamp((int)bt_.found.size(), 1, fit);
+        ch = fixed + nearby * kRowH;
+    }
+    ch = std::min(ch, max_h);
     double cw = std::min(860.0, (double)win_w_ * 0.92);
-    double ch = std::min(1480.0, (double)win_h_ - 240.0);
     L.card = Rect{((double)win_w_ - cw) / 2.0, 120.0, cw, ch};
     const Rect &c = L.card;
     double x0 = c.x + 28, inner = c.w - 56;
@@ -502,7 +525,7 @@ void App::handle_bluetooth_release(double x, double y) {
             bt_.starting = true;
             bt_start_service();
             bt_.sig.clear();
-            redraw_rect(L.card);
+            bt_repaint();
         }
         return;
     }
@@ -518,7 +541,7 @@ void App::handle_bluetooth_release(double x, double y) {
     if (!bt_.forget_armed.empty()) {
         bt_.forget_armed.clear();
         bt_.sig.clear();
-        redraw_rect(L.card);
+        bt_repaint();
     }
 }
 
@@ -529,7 +552,7 @@ void App::key_bluetooth(const KeyEvent &e) {
             bt_.starting = true;
             bt_start_service();
             bt_.sig.clear();
-            redraw_rect(bt_layout().card);
+            bt_repaint();
         }
         return;
     }
@@ -554,7 +577,7 @@ void App::key_bluetooth(const KeyEvent &e) {
     bt_.sel = sel;
     bt_.forget_armed.clear();
     bt_.sig = bt_signature();
-    redraw_rect(bt_layout().card);
+    bt_repaint();
 }
 
 } // namespace bn
